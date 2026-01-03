@@ -203,8 +203,9 @@ def main():
             print("SENTENCE DETECTION")
             print("="*60)
             
-            # Transcribe all audio tracks with word timestamps (use mixed video if available)
-            sentences = transcriber.transcribe_all_tracks(mixed_video_path)
+            # Transcribe all audio tracks with word timestamps (use original video, not mixed)
+            # Transcription needs to process each track individually to identify which track each sentence comes from
+            sentences = transcriber.transcribe_all_tracks(input_path)
             
             if sentences:
                 # Add sentences to logger

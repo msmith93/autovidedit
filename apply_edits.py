@@ -172,12 +172,15 @@ def main():
     # If UI flag is set, launch GUI instead of CLI processing
     if args.ui:
         try:
+            # Store original video path before any mixing
+            original_video_path = input_path
+            
             # Check if mixed audio file exists in output directory (from preprocess.py)
             mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio{input_path.suffix}"
             
             if mixed_video_path.exists():
                 print(f"Using pre-mixed audio file: {mixed_video_path}")
-                input_path = mixed_video_path
+                mixed_video_path_for_ui = mixed_video_path
             else:
                 # Fallback: Check if video has multiple audio tracks and mix them if needed
                 import ffmpeg
@@ -208,15 +211,19 @@ def main():
                         ffmpeg.run(output, quiet=False, overwrite_output=True)  # Show progress
                         
                         print(f"Audio mixing complete. Mixed video saved to: {mixed_video_path}")
-                        input_path = mixed_video_path
+                        mixed_video_path_for_ui = mixed_video_path
+                    else:
+                        # Only one track, no mixing needed
+                        mixed_video_path_for_ui = original_video_path
                 except Exception as e:
                     print(f"Warning: Could not mix audio tracks: {e}. Using original file.", file=sys.stderr)
+                    mixed_video_path_for_ui = original_video_path
             
             from PySide6.QtWidgets import QApplication
             from video_review_ui import VideoReviewWindow
             
             app = QApplication(sys.argv)
-            window = VideoReviewWindow(input_path, json_path)
+            window = VideoReviewWindow(mixed_video_path_for_ui, json_path, original_video_path)
             window.show()
             # Load video after window is shown so VLC can embed properly
             window._load_video()

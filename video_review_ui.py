@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QListWidget, QListWidgetItem, QPushButton, QSlider,
     QLabel, QComboBox, QProgressDialog, QMessageBox, QFileDialog,
-    QMenuBar, QMenu, QToolBar, QStatusBar, QDialog, QDialogButtonBox
+    QMenuBar, QMenu, QToolBar, QStatusBar, QDialog, QDialogButtonBox, QCheckBox
 )
 from PySide6.QtCore import Qt, QUrl, Signal, QThread, QTimer, QSize
 from PySide6.QtGui import QAction, QKeySequence, QShortcut
@@ -26,13 +26,17 @@ class RenderWorker(QThread):
     finished = Signal(bool, str)  # success, message
     error = Signal(str)  # error message
     
-    def __init__(self, input_path: Path, output_path: Path, 
+    def __init__(self, original_video_path: Path, output_path: Path, 
                  segments_to_remove: List[Tuple[float, float]], 
+                 remove_space_between_sentences: bool = False,
+                 modifications: List[Dict[str, Any]] = None,
                  chunk_size: float = 5.0):
         super().__init__()
-        self.input_path = input_path
+        self.input_path = original_video_path  # Use original, not mixed
         self.output_path = output_path
         self.segments_to_remove = segments_to_remove
+        self.remove_space_between_sentences = remove_space_between_sentences
+        self.modifications = modifications
         self.chunk_size = chunk_size
         self._cancelled = False
     
@@ -75,6 +79,9 @@ class RenderWorker(QThread):
                 self.input_path,
                 self.output_path,
                 self.segments_to_remove,
+                self.progress,
+                remove_space_between_sentences=self.remove_space_between_sentences,
+                modifications=self.modifications,
                 chunk_size=self.chunk_size
             )
             
@@ -550,9 +557,10 @@ class PlaybackControlsWidget(QWidget):
 class VideoReviewWindow(QMainWindow):
     """Main window for video review and sentence editing."""
     
-    def __init__(self, video_path: Path, json_path: Path, parent=None):
+    def __init__(self, video_path: Path, json_path: Path, original_video_path: Path = None, parent=None):
         super().__init__(parent)
-        self.video_path = video_path
+        self.video_path = video_path  # Mixed audio file for UI playback
+        self.original_video_path = original_video_path or video_path  # Original file for rendering
         self.json_path = json_path
         self.modifications: List[Dict[str, Any]] = []
         self.has_unsaved_changes = False
@@ -790,10 +798,13 @@ class VideoReviewWindow(QMainWindow):
                 end_time = float(mod.get('end_time', 0.0))
                 removed_segments.append((start_time, end_time))
         
-        if not removed_segments:
+        # Check if we have sentences for "remove space between sentences" mode
+        has_sentences = any(mod.get('reason') == 'Sentence' for mod in self.modifications)
+        
+        if not removed_segments and not has_sentences:
             QMessageBox.information(
                 self, "No Segments to Remove",
-                "No segments are marked for removal. Nothing to render."
+                "No segments are marked for removal and no sentences found. Nothing to render."
             )
             return
         
@@ -811,18 +822,45 @@ class VideoReviewWindow(QMainWindow):
         
         output_path = Path(output_path)
         
-        # Confirmation dialog
-        total_duration = sum(end - start for start, end in removed_segments)
-        reply = QMessageBox.question(
-            self,
-            "Confirm Render",
-            f"Remove {len(removed_segments)} segment(s) totaling {total_duration:.1f} seconds?\n\n"
-            f"Output: {output_path.name}",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
+        # Create custom render options dialog
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Render Options")
+        layout = QVBoxLayout()
         
-        if reply != QMessageBox.StandardButton.Yes:
+        # Confirmation message
+        if removed_segments:
+            total_duration = sum(end - start for start, end in removed_segments)
+            message_text = f"Remove {len(removed_segments)} segment(s) totaling {total_duration:.1f} seconds?\n\n"
+        else:
+            message_text = "Render video?\n\n"
+        message_text += f"Output: {output_path.name}"
+        
+        message_label = QLabel(message_text)
+        layout.addWidget(message_label)
+        
+        # Checkbox for remove space between sentences (only show if sentences exist)
+        remove_space_checkbox = None
+        if has_sentences:
+            remove_space_checkbox = QCheckBox("Remove space between sentences")
+            remove_space_checkbox.setToolTip(
+                "When enabled, only keep segments covered by sentences. "
+                "All gaps between sentences will be removed."
+            )
+            layout.addWidget(remove_space_checkbox)
+        
+        # Dialog buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+        
+        dialog.setLayout(layout)
+        
+        # Show dialog and get result
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        
+        remove_space_between_sentences = remove_space_checkbox.isChecked() if remove_space_checkbox else False
         
         # Show progress dialog
         self.progress_dialog = QProgressDialog("Rendering video...", "Cancel", 0, 100, self)
@@ -832,9 +870,11 @@ class VideoReviewWindow(QMainWindow):
         
         # Create worker thread
         self.render_worker = RenderWorker(
-            self.video_path,
+            self.original_video_path,
             output_path,
             removed_segments,
+            remove_space_between_sentences,
+            self.modifications,
             chunk_size=5.0
         )
         

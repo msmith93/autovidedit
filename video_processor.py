@@ -1,7 +1,7 @@
 """Video processing module for cutting silence segments."""
 
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Callable, Optional, Dict, Any
 import ffmpeg
 
 
@@ -335,6 +335,16 @@ class VideoProcessor:
         
         duration = end_time - start_time
         
+        # Validate segment duration
+        if duration <= 0:
+            raise ValueError(f"Invalid segment duration: {duration:.6f}s (start: {start_time:.2f}s, end: {end_time:.2f}s). Duration must be positive.")
+        
+        if duration < 0.1:
+            raise ValueError(f"Segment duration too small: {duration:.6f}s. Minimum duration is 0.01s.")
+        
+        # Get audio track count to explicitly map each track
+        num_audio_tracks = self.get_audio_track_count(input_path)
+        
         # Use FFmpeg with -ss after -i for more accurate seeking
         # When -ss is before -i, FFmpeg seeks to nearest keyframe (fast but imprecise)
         # When -ss is after -i, FFmpeg does frame-accurate seeking (slower but precise)
@@ -345,11 +355,17 @@ class VideoProcessor:
             '-ss', str(start_time),  # Seek to start (after -i = frame-accurate seeking)
             '-t', str(duration),  # Duration to extract
             '-map', '0:v',  # Map all video streams
-            '-map', '0:a',  # Map all audio streams
+        ]
+        
+        # Explicitly map each audio track individually to ensure preservation
+        for i in range(num_audio_tracks):
+            cmd.extend(['-map', f'0:a:{i}'])
+        
+        cmd.extend([
             '-c', 'copy',  # Stream copy (no re-encoding)
             '-avoid_negative_ts', 'make_zero',  # Handle timestamp issues at boundaries
             '-y', str(output_path)
-        ]
+        ])
         
         result = subprocess.run(
             cmd,
@@ -361,6 +377,21 @@ class VideoProcessor:
         if result.returncode != 0:
             error_msg = result.stderr if result.stderr else "Unknown error"
             raise RuntimeError(f"FFmpeg failed to extract segment ({start_time:.2f}s - {end_time:.2f}s): {error_msg}")
+        
+        # Validate the extracted segment file
+        if not output_path.exists():
+            raise RuntimeError(f"Extracted segment file was not created: {output_path}")
+        
+        if output_path.stat().st_size == 0:
+            raise RuntimeError(f"Extracted segment file is empty: {output_path}")
+        
+        # Verify the file is valid by attempting to probe it
+        try:
+            probe = ffmpeg.probe(str(output_path))
+            if not probe.get('streams'):
+                raise RuntimeError(f"Extracted segment has no streams: {output_path}")
+        except Exception as e:
+            raise RuntimeError(f"Extracted segment file is corrupted or invalid: {output_path}. Error: {e}")
     
     def _extract_segment_chunked(
         self,
@@ -368,6 +399,7 @@ class VideoProcessor:
         start_time: float,
         end_time: float,
         temp_dir: Path,
+        num_audio_tracks: int,
         chunk_size: float = 5.0
     ) -> Path:
         """Extract a segment longer than chunk_size in multiple chunks.
@@ -380,6 +412,7 @@ class VideoProcessor:
             start_time: Start time of segment (seconds)
             end_time: End time of segment (seconds)
             temp_dir: Temporary directory for chunk files
+            num_audio_tracks: Number of audio tracks to preserve
             chunk_size: Size of each chunk in seconds (default: 5.0)
             
         Returns:
@@ -415,16 +448,24 @@ class VideoProcessor:
                 for chunk_file in chunk_files:
                     f.write(f"file '{chunk_file.absolute()}'\n")
             
-            # Concatenate chunks
+            # Concatenate chunks - explicitly map all audio tracks
             import subprocess
             cmd = [
                 'ffmpeg',
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', str(concat_file),
+                '-map', '0:v',  # Map all video streams
+            ]
+            
+            # Explicitly map each audio track individually to ensure preservation
+            for i in range(num_audio_tracks):
+                cmd.extend(['-map', f'0:a:{i}'])
+            
+            cmd.extend([
                 '-c', 'copy',  # Stream copy
                 '-y', str(segment_file)
-            ]
+            ])
             
             result = subprocess.run(
                 cmd,
@@ -436,6 +477,28 @@ class VideoProcessor:
             if result.returncode != 0:
                 error_msg = result.stderr if result.stderr else "Unknown error"
                 raise RuntimeError(f"FFmpeg failed to concatenate chunks: {error_msg}")
+            
+            # Validate the concatenated segment file
+            if not segment_file.exists():
+                raise RuntimeError(f"Concatenated segment file was not created: {segment_file}")
+            
+            if segment_file.stat().st_size == 0:
+                raise RuntimeError(f"Concatenated segment file is empty: {segment_file}")
+            
+            # Verify the file is valid by attempting to probe it
+            try:
+                probe = ffmpeg.probe(str(segment_file))
+                if not probe.get('streams'):
+                    raise RuntimeError(f"Concatenated segment has no streams: {segment_file}")
+                # Verify it has the expected number of audio tracks
+                segment_track_count = len([s for s in probe.get('streams', []) if s.get('codec_type') == 'audio'])
+                if segment_track_count != num_audio_tracks:
+                    raise RuntimeError(
+                        f"Concatenated segment has {segment_track_count} audio track(s), "
+                        f"expected {num_audio_tracks}: {segment_file}"
+                    )
+            except Exception as e:
+                raise RuntimeError(f"Concatenated segment file is corrupted or invalid: {segment_file}. Error: {e}")
             
             # Clean up chunk files and concat file
             for chunk_file in chunk_files:
@@ -450,12 +513,56 @@ class VideoProcessor:
                 chunk_file.unlink(missing_ok=True)
             raise
     
+    def _extract_sentence_segments(self, modifications: List[Dict[str, Any]]) -> List[Tuple[float, float]]:
+        """Extract sentence segments from modifications.
+        
+        Filters modifications where reason == "Sentence" and extracts their time ranges.
+        Sentences marked as REMOVED are excluded.
+        
+        Args:
+            modifications: List of modification dictionaries from JSON
+            
+        Returns:
+            List of (start_time, end_time) tuples for all sentences (sorted and merged)
+        """
+        sentence_segments = []
+        
+        for mod in modifications:
+            if mod.get('reason') == 'Sentence' and mod.get('modification') != 'REMOVED':
+                start_time = float(mod.get('start_time', 0.0))
+                end_time = float(mod.get('end_time', 0.0))
+                if end_time > start_time:  # Only add valid segments
+                    sentence_segments.append((start_time, end_time))
+        
+        # Sort by start time
+        sentence_segments.sort(key=lambda x: x[0])
+        
+        # Merge overlapping/adjacent sentences
+        if not sentence_segments:
+            return []
+        
+        merged = [sentence_segments[0]]
+        for current_start, current_end in sentence_segments[1:]:
+            last_start, last_end = merged[-1]
+            
+            # If current sentence overlaps or is adjacent to the last merged sentence
+            if current_start <= last_end:
+                # Merge by extending the end time
+                merged[-1] = (last_start, max(last_end, current_end))
+            else:
+                # No overlap, add as new segment
+                merged.append((current_start, current_end))
+        
+        return merged
     
     def remove_segments(
         self,
         input_path: Path,
         output_path: Path,
         segments_to_remove: List[Tuple[float, float]],
+        progress: Callable[[int, str], None],
+        remove_space_between_sentences: bool = False,
+        modifications: Optional[List[Dict[str, Any]]] = None,
         chunk_size: float = 5.0
     ):
         """Remove specified segments from video, preserving all audio tracks.
@@ -464,18 +571,51 @@ class VideoProcessor:
             input_path: Path to input video file
             output_path: Path to output video file
             segments_to_remove: List of (start_time, end_time) tuples to remove
+            progress: Progress callback function (percentage, message)
+            remove_space_between_sentences: If True, only keep sentence segments (ignores segments_to_remove)
+            modifications: List of modification dictionaries (required if remove_space_between_sentences is True)
             chunk_size: Size of chunks in seconds for segments longer than chunk_size (default: 5.0)
         """
-        if not segments_to_remove:
-            # No segments to remove, just copy the file
-            self._copy_video(input_path, output_path)
-            return
-        
         # Get video duration and audio track count
         duration = self._get_video_duration(input_path)
         num_audio_tracks = self.get_audio_track_count(input_path)
         
         print(f"Processing video with {num_audio_tracks} audio track(s)")
+        
+        # If remove_space_between_sentences is enabled, calculate segments from sentences
+        if remove_space_between_sentences:
+            if not modifications:
+                raise ValueError("modifications parameter is required when remove_space_between_sentences is True")
+            
+            # Extract sentence segments
+            sentence_segments = self._extract_sentence_segments(modifications)
+            
+            if not sentence_segments:
+                raise ValueError("No sentence segments found in modifications. Cannot remove space between sentences.")
+            
+            print(f"Found {len(sentence_segments)} sentence segment(s) to keep")
+            
+            # Calculate segments_to_remove as the inverse (everything NOT in sentence segments)
+            segments_to_remove = []
+            current_time = 0.0
+            
+            for sent_start, sent_end in sentence_segments:
+                # If there's a gap before this sentence, mark it for removal
+                if sent_start > current_time:
+                    segments_to_remove.append((current_time, sent_start))
+                
+                current_time = max(current_time, sent_end)
+            
+            # Mark everything after the last sentence for removal
+            if current_time < duration:
+                segments_to_remove.append((current_time, duration))
+            
+            print(f"Will remove {len(segments_to_remove)} gap segment(s) between sentences")
+        
+        if not segments_to_remove:
+            # No segments to remove, just copy the file
+            self._copy_video(input_path, output_path)
+            return
         
         # Build list of segments to keep (everything except removed segments)
         segments_to_keep = []
@@ -517,24 +657,55 @@ class VideoProcessor:
             for seg_idx, (seg_start, seg_end) in enumerate(segments_to_keep):
                 seg_duration = seg_end - seg_start
 
+                # Skip segments with zero or negative duration
+                if seg_duration <= 0:
+                    print(f"  Warning: Skipping segment {seg_idx + 1}/{len(segments_to_keep)} with zero/negative duration: {seg_start:.2f}s - {seg_end:.2f}s")
+                    continue
+                
+                # Skip segments that are too small (less than 0.01 seconds)
+                if seg_duration < 0.01:
+                    print(f"  Warning: Skipping segment {seg_idx + 1}/{len(segments_to_keep)} with duration too small ({seg_duration:.6f}s): {seg_start:.2f}s - {seg_end:.2f}s")
+                    continue
+
                 curr_segment = seg_idx + 1
                 total_segments = len(segments_to_keep)
-                progress = max((curr_segment / total_segments) * 100 - 10, 1)
-                self.progress.emit(progress, f"Extracting segment {curr_segment} of {total_segments}")
+                # Funky little calculation to get a progress bar
+                currprogress = max((float(curr_segment) / float(total_segments)) * 100 - 10, 1)
+                progress.emit(currprogress, f"Extracting segment {curr_segment} of {total_segments}")
                 print(f"  Segment {curr_segment}/{total_segments}: {seg_start:.2f}s - {seg_end:.2f}s ({seg_duration:.2f}s)")
                 
                 segment_file = temp_dir / f"segment_{seg_idx:04d}.mkv"
                 
-                if seg_duration <= chunk_size:
-                    # Extract directly (short segment)
-                    self._extract_segment(input_path, seg_start, seg_end, segment_file)
-                else:
-                    # Extract in chunks (long segment)
-                    segment_file = self._extract_segment_chunked(
-                        input_path, seg_start, seg_end, temp_dir, chunk_size
+                try:
+                    if seg_duration <= chunk_size:
+                        # Extract directly (short segment)
+                        self._extract_segment(input_path, seg_start, seg_end, segment_file)
+                    else:
+                        # Extract in chunks (long segment)
+                        segment_file = self._extract_segment_chunked(
+                            input_path, seg_start, seg_end, temp_dir, num_audio_tracks, chunk_size
+                        )
+                    
+                    # Verify segment file before adding to list
+                    if not segment_file.exists():
+                        raise RuntimeError(f"Segment file was not created: {segment_file}")
+                    
+                    if segment_file.stat().st_size == 0:
+                        raise RuntimeError(f"Segment file is empty: {segment_file}")
+                    
+                    segment_files.append(segment_file)
+                except Exception as e:
+                    # Clean up any partial files
+                    if segment_file.exists():
+                        segment_file.unlink(missing_ok=True)
+                    raise RuntimeError(
+                        f"Failed to extract segment {curr_segment}/{total_segments} "
+                        f"({seg_start:.2f}s - {seg_end:.2f}s): {e}"
                     )
-                
-                segment_files.append(segment_file)
+            
+            # Check if we have any valid segments to concatenate
+            if not segment_files:
+                raise ValueError("No valid segments to concatenate. All segments were skipped due to zero or invalid duration.")
             
             # Concatenate all segments
             print(f"\nConcatenating {len(segment_files)} segment(s)...")
@@ -561,6 +732,16 @@ class VideoProcessor:
         """
         import tempfile
         
+        # Verify all segments have the same number of audio tracks
+        for video_file in video_files:
+            segment_track_count = self.get_audio_track_count(video_file)
+            if segment_track_count != num_audio_tracks:
+                raise RuntimeError(
+                    f"Audio track count mismatch: segment {video_file.name} has {segment_track_count} "
+                    f"audio track(s), expected {num_audio_tracks}. All segments must have the same "
+                    f"number of audio tracks for concatenation."
+                )
+        
         # Create concat file for FFmpeg
         concat_file = Path(tempfile.mktemp(suffix='.txt'))
         
@@ -570,18 +751,24 @@ class VideoProcessor:
                     f.write(f"file '{video_file.absolute()}'\n")
             
             # Use concat demuxer to join videos (fast, no re-encoding)
-            # The concat demuxer preserves all streams by default, but we explicitly
-            # map them to be safe (especially important for multiple audio tracks)
+            # Explicitly map each stream to ensure all tracks are preserved
             import subprocess
             cmd = [
                 'ffmpeg',
                 '-f', 'concat',
                 '-safe', '0',
                 '-i', str(concat_file),
-                '-map', '0',  # Map all streams from first input (concat demuxer creates single input)
+                '-map', '0:v',  # Map all video streams
+            ]
+            
+            # Explicitly map each audio track individually to ensure preservation
+            for i in range(num_audio_tracks):
+                cmd.extend(['-map', f'0:a:{i}'])
+            
+            cmd.extend([
                 '-c', 'copy',  # Copy streams without re-encoding
                 '-y', str(output_path)
-            ]
+            ])
             
             result = subprocess.run(
                 cmd,
