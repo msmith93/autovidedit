@@ -1,0 +1,6 @@
+*.mkv
+*.json
+__pycache__
+generate.sh
+applyedit.sh
+venv
