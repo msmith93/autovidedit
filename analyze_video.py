@@ -8,7 +8,6 @@ from pathlib import Path
 from silence_detector import SilenceDetector
 from json_logger import JSONLogger
 from transcriber import Transcriber
-from categorizer import Categorizer
 from video_processor import VideoProcessor
 
 
@@ -36,7 +35,7 @@ def validate_input_file(input_path: Path):
 def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(
-        description='Analyze video files to detect silence and optionally categorize content',
+        description='Analyze video files to detect silence and optionally transcribe sentences',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -75,10 +74,10 @@ def main():
     )
     
     parser.add_argument(
-        '--categorize',
+        '--sentences',
         action='store_true',
         default=False,
-        help='Enable AI categorization to identify topic sections (default: False)'
+        help='Enable sentence detection from audio transcription (default: False)'
     )
     
     args = parser.parse_args()
@@ -113,44 +112,34 @@ def main():
         )
         logger = JSONLogger()
         
-        # Initialize transcription and categorization if enabled
+        # Initialize transcription if enabled
         transcriber = None
-        categorizer = None
-        if args.categorize:
-            print("Initializing transcription and categorization...")
+        if args.sentences:
+            print("Initializing transcription...")
             transcriber = Transcriber()
-            try:
-                categorizer = Categorizer()
-            except RuntimeError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
         
-        # Run categorization if enabled
-        if args.categorize:
+        # Run sentence detection if enabled
+        if args.sentences:
             print("\n" + "="*60)
-            print("CATEGORIZATION")
+            print("SENTENCE DETECTION")
             print("="*60)
             
-            # Get video duration for categorization
-            # We need to create a VideoProcessor just to get duration (it's a private method)
-            temp_processor = VideoProcessor()
-            video_duration = temp_processor._get_video_duration(input_path)
+            # Transcribe all audio tracks with word timestamps
+            sentences = transcriber.transcribe_all_tracks(input_path)
             
-            # Transcribe video
-            transcript_segments = transcriber.transcribe(input_path)
-            
-            if transcript_segments:
-                # Categorize transcript
-                print("\nAnalyzing transcript to identify topic sections...")
-                categories = categorizer.categorize(transcript_segments, video_duration)
-                
-                # Add categories to logger
-                print(f"\nIdentified {len(categories)} topic section(s):")
-                for start, end, description in categories:
-                    logger.add_categorization(start, end, description)
-                    print(f"  {start:.2f}s - {end:.2f}s: {description}")
+            if sentences:
+                # Add sentences to logger
+                print(f"\nIdentified {len(sentences)} sentence(s):")
+                for sentence in sentences:
+                    logger.add_sentence(
+                        sentence['start'],
+                        sentence['end'],
+                        sentence['words'],
+                        sentence['audio_track']
+                    )
+                    print(f"  Track {sentence['audio_track']}: {sentence['start']:.2f}s - {sentence['end']:.2f}s: {sentence['words'][:60]}...")
             else:
-                print("Warning: No transcript segments found. Skipping categorization.")
+                print("Warning: No sentences found in audio tracks.")
             
             print()
         

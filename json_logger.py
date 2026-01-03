@@ -29,20 +29,31 @@ class JSONLogger:
         }
         self.modifications.append(entry)
     
-    def add_categorization(self, start_time: float, end_time: float, reason: str):
-        """Add a categorization entry to the log.
+    def add_sentence(
+        self,
+        start_time: float,
+        end_time: float,
+        words: str,
+        audio_track: int
+    ):
+        """Add a sentence entry to the log.
         
         Args:
-            start_time: Start timestamp of categorized segment (seconds)
-            end_time: End timestamp of categorized segment (seconds)
-            reason: Category description/topic
+            start_time: Start timestamp of sentence (seconds)
+            end_time: End timestamp of sentence (seconds)
+            words: Sentence text
+            audio_track: Audio track number (1-indexed)
         """
         duration = end_time - start_time
         entry = {
             "start_time": round(start_time, 3),
             "end_time": round(end_time, 3),
-            "modification": "CATEGORIZED",
-            "reason": reason,
+            "modification": "NONE",
+            "reason": "Sentence",
+            "content": {
+                "audio_track": audio_track,
+                "words": words
+            },
             "duration": round(duration, 3)
         }
         self.modifications.append(entry)

@@ -537,8 +537,8 @@ class VideoProcessor:
             
         finally:
             # Clean up temporary directory and all files
-            # if temp_dir.exists():
-            #     shutil.rmtree(temp_dir, ignore_errors=True)
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
             pass
     
     def _concatenate_videos(
