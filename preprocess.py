@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Main script for removing dead air from MKV video files."""
+"""Preprocessing script for video analysis and audio mixing."""
 
 import argparse
 import sys
+import os
 from pathlib import Path
 
 from silence_detector import SilenceDetector
@@ -35,7 +36,7 @@ def validate_input_file(input_path: Path):
 def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(
-        description='Remove dead air (silence) from video files',
+        description='Preprocess video files: mix audio tracks, detect silence, and transcribe sentences',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -106,16 +107,68 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     
-    # Determine output paths
+    # Create output directory in project folder
+    project_dir = Path(__file__).parent.absolute()
+    output_dir = project_dir / f"{input_path.stem}_preprocessed"
+    output_dir.mkdir(exist_ok=True)
+    
+    print(f"Output directory: {output_dir}")
+    
+    # Determine output paths (in output directory)
     if args.output:
         output_path = Path(args.output)
+        if not output_path.is_absolute():
+            output_path = output_dir / output_path
     else:
-        output_path = input_path.parent / f"{input_path.stem}_processed{input_path.suffix}"
+        output_path = output_dir / f"{input_path.stem}_processed{input_path.suffix}"
     
     if args.json_output:
         json_path = Path(args.json_output)
+        if not json_path.is_absolute():
+            json_path = output_dir / json_path
     else:
-        json_path = input_path.parent / f"{input_path.stem}_modifications.json"
+        json_path = output_dir / f"{input_path.stem}_modifications.json"
+    
+    # Check for multiple audio tracks and mix them
+    mixed_video_path = input_path
+    import ffmpeg
+    try:
+        probe = ffmpeg.probe(str(input_path))
+        audio_streams = [s for s in probe.get('streams', []) if s.get('codec_type') == 'audio']
+        
+        if len(audio_streams) > 1:
+            print(f"\n{'='*60}")
+            print("AUDIO MIXING")
+            print(f"{'='*60}")
+            print(f"Detected {len(audio_streams)} audio tracks. Mixing audio tracks...")
+            print("This may take a moment for large videos...")
+            
+            mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio{input_path.suffix}"
+            
+            # Mix all audio tracks using FFmpeg
+            stream = ffmpeg.input(str(input_path))
+            audio_inputs = [stream[f'a:{i}'] for i in range(len(audio_streams))]
+            mixed_audio = ffmpeg.filter(audio_inputs, 'amix', inputs=len(audio_inputs))
+            
+            output = ffmpeg.output(
+                stream.video,
+                mixed_audio,
+                str(mixed_video_path),
+                vcodec='copy',
+                acodec='aac',
+                **{'y': None}
+            )
+            
+            ffmpeg.run(output, quiet=False, overwrite_output=True)  # Show progress
+            
+            print(f"Audio mixing complete. Mixed video saved to: {mixed_video_path}")
+            print()
+        else:
+            print(f"Video has {len(audio_streams)} audio track(s). No mixing needed.")
+            print()
+    except Exception as e:
+        print(f"Warning: Could not check/mix audio tracks: {e}. Using original file.", file=sys.stderr)
+        print()
     
     print(f"Processing: {input_path}")
     if args.encode_video:
@@ -150,8 +203,8 @@ def main():
             print("SENTENCE DETECTION")
             print("="*60)
             
-            # Transcribe all audio tracks with word timestamps
-            sentences = transcriber.transcribe_all_tracks(input_path)
+            # Transcribe all audio tracks with word timestamps (use mixed video if available)
+            sentences = transcriber.transcribe_all_tracks(mixed_video_path)
             
             if sentences:
                 # Add sentences to logger
@@ -169,12 +222,12 @@ def main():
             
             print()
         
-        # Detect silence segments
+        # Detect silence segments (use mixed video if available)
         print("="*60)
         print("SILENCE DETECTION")
         print("="*60)
         print("Extracting audio and detecting silence...")
-        silence_segments = detector.detect_silence_segments(input_path)
+        silence_segments = detector.detect_silence_segments(mixed_video_path)
         
         # Merge overlapping segments
         silence_segments = detector.merge_overlapping_segments(silence_segments)
@@ -203,12 +256,12 @@ def main():
             
             if not silence_segments:
                 print("\nNo silence detected. Video will be copied without modification.")
-                processor._copy_video(input_path, output_path)
+                processor._copy_video(mixed_video_path, output_path)
                 print(f"Done! Output saved to: {output_path}")
             else:
-                # Process video
+                # Process video (use mixed video if available)
                 print("\nRemoving segments from video...")
-                processor.remove_segments(input_path, output_path, silence_segments)
+                processor.remove_segments(mixed_video_path, output_path, silence_segments)
                 print(f"\nDone! Output saved to: {output_path}")
         else:
             print("\nVideo encoding skipped (use --encode-video to enable)")

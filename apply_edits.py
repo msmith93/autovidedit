@@ -132,17 +132,37 @@ def main():
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
     
+    # Create output directory in project folder (same as preprocess.py)
+    project_dir = Path(__file__).parent.absolute()
+    output_dir = project_dir / f"{input_path.stem}_preprocessed"
+    output_dir.mkdir(exist_ok=True)
+    
+    print(f"Output directory: {output_dir}")
+    
     # Determine JSON input path
     if args.json_input:
         json_path = Path(args.json_input)
+        if not json_path.is_absolute():
+            # Try output directory first, then relative to input
+            if (output_dir / json_path).exists():
+                json_path = output_dir / json_path
+            else:
+                json_path = input_path.parent / json_path
     else:
-        json_path = input_path.parent / f"{input_path.stem}_modifications.json"
+        # Default: look in output directory first, then input directory
+        default_json = f"{input_path.stem}_modifications.json"
+        if (output_dir / default_json).exists():
+            json_path = output_dir / default_json
+        else:
+            json_path = input_path.parent / default_json
     
-    # Determine output path
+    # Determine output path (in output directory)
     if args.output:
         output_path = Path(args.output)
+        if not output_path.is_absolute():
+            output_path = output_dir / output_path
     else:
-        output_path = input_path.parent / f"{input_path.stem}_processed{input_path.suffix}"
+        output_path = output_dir / f"{input_path.stem}_processed{input_path.suffix}"
     
     # Ensure output doesn't overwrite input
     if output_path.resolve() == input_path.resolve():
@@ -152,42 +172,45 @@ def main():
     # If UI flag is set, launch GUI instead of CLI processing
     if args.ui:
         try:
-            # Check if video has multiple audio tracks and mix them if needed
-            import ffmpeg
-            try:
-                probe = ffmpeg.probe(str(input_path))
-                audio_streams = [s for s in probe.get('streams', []) if s.get('codec_type') == 'audio']
-                
-                if len(audio_streams) > 1:
-                    print(f"Detected {len(audio_streams)} audio tracks. Mixing audio tracks...")
-                    print("This may take a moment for large videos...")
+            # Check if mixed audio file exists in output directory (from preprocess.py)
+            mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio{input_path.suffix}"
+            
+            if mixed_video_path.exists():
+                print(f"Using pre-mixed audio file: {mixed_video_path}")
+                input_path = mixed_video_path
+            else:
+                # Fallback: Check if video has multiple audio tracks and mix them if needed
+                import ffmpeg
+                try:
+                    probe = ffmpeg.probe(str(input_path))
+                    audio_streams = [s for s in probe.get('streams', []) if s.get('codec_type') == 'audio']
                     
-                    import tempfile
-                    temp_file = tempfile.NamedTemporaryFile(suffix='.mkv', delete=False)
-                    temp_path = Path(temp_file.name)
-                    temp_file.close()
-                    
-                    # Mix all audio tracks using FFmpeg
-                    stream = ffmpeg.input(str(input_path))
-                    audio_inputs = [stream[f'a:{i}'] for i in range(len(audio_streams))]
-                    mixed_audio = ffmpeg.filter(audio_inputs, 'amix', inputs=len(audio_inputs))
-                    
-                    output = ffmpeg.output(
-                        stream.video,
-                        mixed_audio,
-                        str(temp_path),
-                        vcodec='copy',
-                        acodec='aac',
-                        **{'y': None}
-                    )
-                    
-                    ffmpeg.run(output, quiet=False, overwrite_output=True)  # Show progress
-                    
-                    print(f"Audio mixing complete. Using temporary file: {temp_path}")
-                    # Use the mixed file for the UI
-                    input_path = temp_path
-            except Exception as e:
-                print(f"Warning: Could not mix audio tracks: {e}. Using original file.", file=sys.stderr)
+                    if len(audio_streams) > 1:
+                        print(f"Detected {len(audio_streams)} audio tracks. Mixing audio tracks...")
+                        print("This may take a moment for large videos...")
+                        
+                        mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio{input_path.suffix}"
+                        
+                        # Mix all audio tracks using FFmpeg
+                        stream = ffmpeg.input(str(input_path))
+                        audio_inputs = [stream[f'a:{i}'] for i in range(len(audio_streams))]
+                        mixed_audio = ffmpeg.filter(audio_inputs, 'amix', inputs=len(audio_inputs))
+                        
+                        output = ffmpeg.output(
+                            stream.video,
+                            mixed_audio,
+                            str(mixed_video_path),
+                            vcodec='copy',
+                            acodec='aac',
+                            **{'y': None}
+                        )
+                        
+                        ffmpeg.run(output, quiet=False, overwrite_output=True)  # Show progress
+                        
+                        print(f"Audio mixing complete. Mixed video saved to: {mixed_video_path}")
+                        input_path = mixed_video_path
+                except Exception as e:
+                    print(f"Warning: Could not mix audio tracks: {e}. Using original file.", file=sys.stderr)
             
             from PySide6.QtWidgets import QApplication
             from video_review_ui import VideoReviewWindow

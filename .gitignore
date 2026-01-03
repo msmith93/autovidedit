@@ -2,5 +2,7 @@
 *.json
 __pycache__
 generate.sh
+preprocess.sh
 applyedit.sh
+videdit.sh
 venv
