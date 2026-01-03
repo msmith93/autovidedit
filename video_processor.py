@@ -513,14 +513,21 @@ class VideoProcessor:
                 chunk_file.unlink(missing_ok=True)
             raise
     
-    def _extract_sentence_segments(self, modifications: List[Dict[str, Any]]) -> List[Tuple[float, float]]:
-        """Extract sentence segments from modifications.
+    def _extract_sentence_segments(
+        self, 
+        modifications: List[Dict[str, Any]], 
+        padding: float = 0.2,
+        video_duration: Optional[float] = None
+    ) -> List[Tuple[float, float]]:
+        """Extract sentence segments from modifications with optional padding.
         
         Filters modifications where reason == "Sentence" and extracts their time ranges.
-        Sentences marked as REMOVED are excluded.
+        Sentences marked as REMOVED are excluded. Applies padding before and after each sentence.
         
         Args:
             modifications: List of modification dictionaries from JSON
+            padding: Padding in seconds to add before and after each sentence (default: 0.2)
+            video_duration: Optional video duration to clamp padding (prevents going beyond video)
             
         Returns:
             List of (start_time, end_time) tuples for all sentences (sorted and merged)
@@ -532,7 +539,13 @@ class VideoProcessor:
                 start_time = float(mod.get('start_time', 0.0))
                 end_time = float(mod.get('end_time', 0.0))
                 if end_time > start_time:  # Only add valid segments
-                    sentence_segments.append((start_time, end_time))
+                    # Apply padding
+                    padded_start = max(0.0, start_time - padding)
+                    padded_end = end_time + padding
+                    if video_duration is not None:
+                        padded_end = min(padded_end, video_duration)
+                    
+                    sentence_segments.append((padded_start, padded_end))
         
         # Sort by start time
         sentence_segments.sort(key=lambda x: x[0])
@@ -587,8 +600,12 @@ class VideoProcessor:
             if not modifications:
                 raise ValueError("modifications parameter is required when remove_space_between_sentences is True")
             
-            # Extract sentence segments
-            sentence_segments = self._extract_sentence_segments(modifications)
+            # Extract sentence segments with padding (0.2 seconds default)
+            sentence_segments = self._extract_sentence_segments(
+                modifications, 
+                padding=0.2,
+                video_duration=duration
+            )
             
             if not sentence_segments:
                 raise ValueError("No sentence segments found in modifications. Cannot remove space between sentences.")
