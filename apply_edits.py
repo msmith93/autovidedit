@@ -113,6 +113,13 @@ def main():
         help='Size of chunks in seconds for extracting long segments (default: 5.0)'
     )
     
+    parser.add_argument(
+        '--ui',
+        action='store_true',
+        default=False,
+        help='Launch GUI for video review and editing (default: False)'
+    )
+    
     args = parser.parse_args()
     
     # Convert to Path objects
@@ -141,6 +148,64 @@ def main():
     if output_path.resolve() == input_path.resolve():
         print("Error: Output file cannot be the same as input file", file=sys.stderr)
         sys.exit(1)
+    
+    # If UI flag is set, launch GUI instead of CLI processing
+    if args.ui:
+        try:
+            # Check if video has multiple audio tracks and mix them if needed
+            import ffmpeg
+            try:
+                probe = ffmpeg.probe(str(input_path))
+                audio_streams = [s for s in probe.get('streams', []) if s.get('codec_type') == 'audio']
+                
+                if len(audio_streams) > 1:
+                    print(f"Detected {len(audio_streams)} audio tracks. Mixing audio tracks...")
+                    print("This may take a moment for large videos...")
+                    
+                    import tempfile
+                    temp_file = tempfile.NamedTemporaryFile(suffix='.mkv', delete=False)
+                    temp_path = Path(temp_file.name)
+                    temp_file.close()
+                    
+                    # Mix all audio tracks using FFmpeg
+                    stream = ffmpeg.input(str(input_path))
+                    audio_inputs = [stream[f'a:{i}'] for i in range(len(audio_streams))]
+                    mixed_audio = ffmpeg.filter(audio_inputs, 'amix', inputs=len(audio_inputs))
+                    
+                    output = ffmpeg.output(
+                        stream.video,
+                        mixed_audio,
+                        str(temp_path),
+                        vcodec='copy',
+                        acodec='aac',
+                        **{'y': None}
+                    )
+                    
+                    ffmpeg.run(output, quiet=False, overwrite_output=True)  # Show progress
+                    
+                    print(f"Audio mixing complete. Using temporary file: {temp_path}")
+                    # Use the mixed file for the UI
+                    input_path = temp_path
+            except Exception as e:
+                print(f"Warning: Could not mix audio tracks: {e}. Using original file.", file=sys.stderr)
+            
+            from PySide6.QtWidgets import QApplication
+            from video_review_ui import VideoReviewWindow
+            
+            app = QApplication(sys.argv)
+            window = VideoReviewWindow(input_path, json_path)
+            window.show()
+            # Load video after window is shown so VLC can embed properly
+            window._load_video()
+            sys.exit(app.exec())
+        except ImportError as e:
+            print(f"Error: Required packages not installed. Install with: pip install -r requirements.txt", file=sys.stderr)
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error launching UI: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
     
     print(f"Input video: {input_path}")
     print(f"JSON modifications: {json_path}")

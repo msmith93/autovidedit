@@ -175,6 +175,7 @@ class Transcriber:
             print(f"Transcribing audio with Whisper (this may take a while)...")
             result = self._model.transcribe(
                 str(tmp_audio_path),
+                language='en',
                 verbose=False,  # Suppress progress output (we'll print our own)
                 word_timestamps=False  # We only need segment-level timestamps
             )
@@ -237,6 +238,7 @@ class Transcriber:
                 print(f"  Transcribing audio track {track_num} with Whisper (this may take a while)...")
                 result = self._model.transcribe(
                     str(tmp_audio_path),
+                    language='en',
                     verbose=False,
                     word_timestamps=True  # Enable word-level timestamps
                 )
