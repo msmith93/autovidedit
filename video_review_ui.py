@@ -268,7 +268,7 @@ class VideoPlayerWidget(QWidget):
         return state == vlc.State.Playing
     
     def set_playback_rate(self, rate: float):
-        """Set playback speed (0.5x to 2.0x)."""
+        """Set playback speed (0.5x to 8.0x)."""
         self.media_player.set_rate(rate)
     
     def _poll_position(self):
@@ -461,7 +461,7 @@ class PlaybackControlsWidget(QWidget):
         layout.addWidget(speed_label)
         
         self.speed_combo = QComboBox()
-        self.speed_combo.addItems(["0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x"])
+        self.speed_combo.addItems(["0.5x", "1.0x", "2.0x", "4.0x", "8.0x"])
         self.speed_combo.setCurrentText("1.0x")
         self.speed_combo.currentTextChanged.connect(self._on_speed_changed)
         layout.addWidget(self.speed_combo)

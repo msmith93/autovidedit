@@ -516,7 +516,12 @@ class VideoProcessor:
             
             for seg_idx, (seg_start, seg_end) in enumerate(segments_to_keep):
                 seg_duration = seg_end - seg_start
-                print(f"  Segment {seg_idx + 1}/{len(segments_to_keep)}: {seg_start:.2f}s - {seg_end:.2f}s ({seg_duration:.2f}s)")
+
+                curr_segment = seg_idx + 1
+                total_segments = len(segments_to_keep)
+                progress = max((curr_segment / total_segments) * 100 - 10, 1)
+                self.progress.emit(progress, f"Extracting segment {curr_segment} of {total_segments}")
+                print(f"  Segment {curr_segment}/{total_segments}: {seg_start:.2f}s - {seg_end:.2f}s ({seg_duration:.2f}s)")
                 
                 segment_file = temp_dir / f"segment_{seg_idx:04d}.mkv"
                 
