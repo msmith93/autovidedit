@@ -175,6 +175,13 @@ def main():
             # Store original video path before any mixing
             original_video_path = input_path
             
+            # Check if keyframe-optimized version exists in output directory (from preprocess.py)
+            optimized_video_path = output_dir / f"{input_path.stem}_keyframe_optimized{input_path.suffix}"
+            if optimized_video_path.exists():
+                print(f"Using keyframe-optimized video: {optimized_video_path}")
+                # Use optimized version for rendering (preserves all audio tracks)
+                original_video_path = optimized_video_path
+            
             # Check if mixed audio file exists in output directory (from preprocess.py)
             mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio{input_path.suffix}"
             

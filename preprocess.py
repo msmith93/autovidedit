@@ -95,6 +95,13 @@ def main():
         help='Enable sentence detection from audio transcription (default: False)'
     )
     
+    parser.add_argument(
+        '--optimize-keyframes',
+        action='store_true',
+        default=False,
+        help='Create keyframe-optimized version with GOP=5 for precise cuts with -c copy (default: False)'
+    )
+    
     args = parser.parse_args()
     
     # Convert to Path objects
@@ -169,6 +176,31 @@ def main():
     except Exception as e:
         print(f"Warning: Could not check/mix audio tracks: {e}. Using original file.", file=sys.stderr)
         print()
+    
+    # Keyframe optimization (if enabled)
+    optimized_video_path = None
+    if args.optimize_keyframes:
+        print(f"\n{'='*60}")
+        print("KEYFRAME OPTIMIZATION")
+        print(f"{'='*60}")
+        print("Creating keyframe-optimized version with GOP=5...")
+        print("This allows precise cuts with -c copy during rendering.")
+        print("This may take a moment for large videos...")
+        
+        try:
+            processor_optimize = VideoProcessor()
+            optimized_video_path = output_dir / f"{input_path.stem}_keyframe_optimized{input_path.suffix}"
+            
+            def progress_callback(message: str):
+                print(f"  {message}")
+            
+            processor_optimize.optimize_keyframes(input_path, optimized_video_path, progress=progress_callback)
+            print(f"Keyframe optimization complete. Optimized video saved to: {optimized_video_path}")
+            print()
+        except Exception as e:
+            print(f"Warning: Keyframe optimization failed: {e}. Continuing without optimization.", file=sys.stderr)
+            print("You can still use re-encoding at render time for precise cuts.", file=sys.stderr)
+            print()
     
     print(f"Processing: {input_path}")
     if args.encode_video:

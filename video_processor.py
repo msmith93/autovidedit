@@ -881,3 +881,91 @@ class VideoProcessor:
         except ffmpeg.Error as e:
             error_msg = e.stderr.decode('utf-8', errors='ignore') if e.stderr else str(e)
             raise RuntimeError(f"Failed to copy video: {error_msg}")
+    
+    def optimize_keyframes(
+        self,
+        input_path: Path,
+        output_path: Path,
+        progress: Optional[Callable[[str], None]] = None
+    ) -> None:
+        """Optimize video keyframes by re-encoding with GOP=5.
+        
+        Re-encodes video stream with frequent keyframes (GOP=5) while
+        preserving all audio tracks. This allows precise cuts with -c copy
+        during rendering, reducing choppiness without re-encoding at render time.
+        
+        Args:
+            input_path: Path to input video file
+            output_path: Path to output video file
+            progress: Optional callback function for progress updates (message: str) -> None
+            
+        Raises:
+            RuntimeError: If optimization fails
+        """
+        import subprocess
+        
+        if progress:
+            progress("Optimizing keyframes (GOP=5)...")
+        
+        # Get encoding parameters (same as re-encoding logic)
+        video_codec, video_params = self._get_video_encoding_params(input_path)
+        
+        # Add GOP size parameter (GOP = 5 frames)
+        video_params.extend(['-g', '5'])
+        
+        # Get audio track count to preserve all tracks
+        num_audio_tracks = self.get_audio_track_count(input_path)
+        
+        # Build FFmpeg command
+        cmd = [
+            'ffmpeg',
+            '-i', str(input_path),
+            '-map', '0:v',  # Map video stream
+        ]
+        
+        # Re-encode video with GOP=5
+        cmd.extend(['-c:v', video_codec])
+        cmd.extend(video_params)
+        
+        # Map all audio tracks and copy (preserve audio quality)
+        for i in range(num_audio_tracks):
+            cmd.extend(['-map', f'0:a:{i}'])
+        
+        # Copy all audio streams (no re-encoding)
+        cmd.extend(['-c:a', 'copy'])
+        
+        # Handle timestamp issues
+        cmd.extend([
+            '-avoid_negative_ts', 'make_zero',
+            '-y', str(output_path)
+        ])
+        
+        # Run FFmpeg
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr if result.stderr else "Unknown error"
+            raise RuntimeError(f"Failed to optimize keyframes: {error_msg}")
+        
+        # Validate output file
+        if not output_path.exists():
+            raise RuntimeError(f"Optimized video file was not created: {output_path}")
+        
+        if output_path.stat().st_size == 0:
+            raise RuntimeError(f"Optimized video file is empty: {output_path}")
+        
+        # Verify the file is valid
+        try:
+            probe = ffmpeg.probe(str(output_path))
+            if not probe.get('streams'):
+                raise RuntimeError(f"Optimized video has no streams: {output_path}")
+        except Exception as e:
+            raise RuntimeError(f"Optimized video file is corrupted or invalid: {output_path}. Error: {e}")
+        
+        if progress:
+            progress("Keyframe optimization complete")
