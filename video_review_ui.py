@@ -30,6 +30,7 @@ class RenderWorker(QThread):
                  segments_to_remove: List[Tuple[float, float]], 
                  remove_space_between_sentences: bool = False,
                  modifications: List[Dict[str, Any]] = None,
+                 re_encode_video: bool = False,
                  chunk_size: float = 5.0):
         super().__init__()
         self.input_path = original_video_path  # Use original, not mixed
@@ -37,6 +38,7 @@ class RenderWorker(QThread):
         self.segments_to_remove = segments_to_remove
         self.remove_space_between_sentences = remove_space_between_sentences
         self.modifications = modifications
+        self.re_encode_video = re_encode_video
         self.chunk_size = chunk_size
         self._cancelled = False
     
@@ -82,6 +84,7 @@ class RenderWorker(QThread):
                 self.progress,
                 remove_space_between_sentences=self.remove_space_between_sentences,
                 modifications=self.modifications,
+                re_encode_video=self.re_encode_video,
                 chunk_size=self.chunk_size
             )
             
@@ -323,6 +326,9 @@ class SentenceListWidget(QListWidget):
         self.current_sentence_index = -1
         self._has_unsaved_changes = False
         
+        # Enable multi-selection (Ctrl+Click for individual, Shift+Click for range)
+        self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        
         self.itemClicked.connect(self._on_item_clicked)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
@@ -348,9 +354,15 @@ class SentenceListWidget(QListWidget):
             self.addItem(item)
     
     def _on_item_clicked(self, item: SentenceItem):
-        """Handle sentence click - seek to timestamp."""
-        self.sentence_clicked.emit(item.start_time)
-        self._center_item(item)
+        """Handle sentence click - seek to timestamp (unless modifier keys are pressed for multi-select)."""
+        # Get current keyboard modifiers
+        modifiers = QApplication.keyboardModifiers()
+        
+        # Only seek to timestamp if no modifier keys are pressed (single click without Ctrl/Shift)
+        # This allows multi-select to work without interfering with video seeking
+        if modifiers == Qt.KeyboardModifier.NoModifier:
+            self.sentence_clicked.emit(item.start_time)
+            self._center_item(item)
     
     def _center_item(self, item: SentenceItem):
         """Center the clicked item in the view."""
@@ -360,18 +372,40 @@ class SentenceListWidget(QListWidget):
     
     def _show_context_menu(self, position):
         """Show context menu for sentence actions."""
-        item = self.itemAt(position)
-        if not isinstance(item, SentenceItem):
-            return
+        selected_items = self.selectedItems()
+        
+        # Filter to only SentenceItem instances
+        selected_sentences = [item for item in selected_items if isinstance(item, SentenceItem)]
         
         menu = QMenu(self)
         
-        if item.is_removed:
-            unmark_action = menu.addAction("Unmark for removal")
-            unmark_action.triggered.connect(lambda: self._unmark_sentence(item))
+        if len(selected_sentences) > 1:
+            # Multiple selection - show both actions
+            mark_action = menu.addAction(f"Mark {len(selected_sentences)} selected for removal")
+            unmark_action = menu.addAction(f"Unmark {len(selected_sentences)} selected for removal")
+            mark_action.triggered.connect(self._mark_selected_sentences)
+            unmark_action.triggered.connect(self._unmark_selected_sentences)
+        elif len(selected_sentences) == 1:
+            # Single selection - show appropriate action based on state
+            item = selected_sentences[0]
+            if item.is_removed:
+                unmark_action = menu.addAction("Unmark for removal")
+                unmark_action.triggered.connect(lambda: self._unmark_sentence(item))
+            else:
+                mark_action = menu.addAction("Mark for removal")
+                mark_action.triggered.connect(lambda: self._mark_sentence(item))
         else:
-            mark_action = menu.addAction("Mark for removal")
-            mark_action.triggered.connect(lambda: self._mark_sentence(item))
+            # No selection - try to get item at position
+            item = self.itemAt(position)
+            if isinstance(item, SentenceItem):
+                if item.is_removed:
+                    unmark_action = menu.addAction("Unmark for removal")
+                    unmark_action.triggered.connect(lambda: self._unmark_sentence(item))
+                else:
+                    mark_action = menu.addAction("Mark for removal")
+                    mark_action.triggered.connect(lambda: self._mark_sentence(item))
+            else:
+                return  # No valid item
         
         menu.exec(self.mapToGlobal(position))
     
@@ -388,6 +422,34 @@ class SentenceListWidget(QListWidget):
         self.itemChanged.emit(item)
         self._has_unsaved_changes = True
         self._notify_parent_of_changes()
+    
+    def _mark_selected_sentences(self):
+        """Mark all selected sentences for removal."""
+        selected_items = self.selectedItems()
+        selected_sentences = [item for item in selected_items if isinstance(item, SentenceItem)]
+        
+        for item in selected_sentences:
+            if not item.is_removed:
+                item.mark_for_removal()
+                self.itemChanged.emit(item)
+        
+        if selected_sentences:
+            self._has_unsaved_changes = True
+            self._notify_parent_of_changes()
+    
+    def _unmark_selected_sentences(self):
+        """Unmark all selected sentences for removal."""
+        selected_items = self.selectedItems()
+        selected_sentences = [item for item in selected_items if isinstance(item, SentenceItem)]
+        
+        for item in selected_sentences:
+            if item.is_removed:
+                item.unmark_for_removal()
+                self.itemChanged.emit(item)
+        
+        if selected_sentences:
+            self._has_unsaved_changes = True
+            self._notify_parent_of_changes()
     
     def _notify_parent_of_changes(self):
         """Notify parent VideoReviewWindow of unsaved changes."""
@@ -848,6 +910,15 @@ class VideoReviewWindow(QMainWindow):
             )
             layout.addWidget(remove_space_checkbox)
         
+        # Checkbox for re-encode video
+        re_encode_checkbox = QCheckBox("Re-encode video for precise cuts")
+        re_encode_checkbox.setToolTip(
+            "Re-encoding allows precise cuts at any frame but is slower. "
+            "Unchecked uses fast copy method (may have choppiness at cut points)."
+        )
+        re_encode_checkbox.setChecked(False)  # Default to unchecked (fast copy method)
+        layout.addWidget(re_encode_checkbox)
+        
         # Dialog buttons
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(dialog.accept)
@@ -861,6 +932,7 @@ class VideoReviewWindow(QMainWindow):
             return
         
         remove_space_between_sentences = remove_space_checkbox.isChecked() if remove_space_checkbox else False
+        re_encode_video = re_encode_checkbox.isChecked()
         
         # Show progress dialog
         self.progress_dialog = QProgressDialog("Rendering video...", "Cancel", 0, 100, self)
@@ -875,6 +947,7 @@ class VideoReviewWindow(QMainWindow):
             removed_segments,
             remove_space_between_sentences,
             self.modifications,
+            re_encode_video,
             chunk_size=5.0
         )
         

@@ -313,23 +313,68 @@ class VideoProcessor:
         
         return merged
     
+    def _get_video_encoding_params(self, input_path: Path) -> Tuple[str, List[str]]:
+        """Get video encoding parameters based on input video and available hardware.
+        
+        Args:
+            input_path: Path to input video file
+            
+        Returns:
+            Tuple of (video_codec, list of codec-specific parameters)
+        """
+        # Check for hardware acceleration
+        if self._nvenc_available:
+            # Use NVENC hardware encoding
+            codec = 'h264_nvenc'
+            params = [
+                '-preset', 'fast',  # Hardware-optimized preset
+                '-rc', 'vbr',  # Variable bitrate mode
+                '-cq', '18',  # Constant quality (18 = high quality, visually lossless)
+            ]
+        else:
+            # Use software encoding
+            codec = 'libx264'
+            params = [
+                '-crf', '18',  # Constant Rate Factor (18 = high quality, visually lossless)
+                '-preset', 'slow',  # Slower preset = better compression/quality
+            ]
+        
+        # Get video properties to maintain
+        try:
+            probe = ffmpeg.probe(str(input_path))
+            video_stream = next((s for s in probe.get('streams', []) if s.get('codec_type') == 'video'), None)
+            
+            if video_stream:
+                # Use yuv420p for maximum compatibility (most common pixel format)
+                # This ensures re-encoded segments can be concatenated smoothly
+                params.extend(['-pix_fmt', 'yuv420p'])
+        except Exception:
+            # Fallback to yuv420p if probe fails
+            params.extend(['-pix_fmt', 'yuv420p'])
+        
+        # Add constant frame rate
+        params.extend(['-vsync', 'cfr'])
+        
+        return codec, params
+    
     def _extract_segment(
         self,
         input_path: Path,
         start_time: float,
         end_time: float,
-        output_path: Path
+        output_path: Path,
+        re_encode_video: bool = False
     ):
         """Extract a single segment from video to a temporary file.
         
-        Uses stream copy (-c copy) for fast, low-memory extraction.
-        Preserves all video and audio tracks.
+        Can either re-encode video for precise cuts or use stream copy for speed.
         
         Args:
             input_path: Path to input video file
             start_time: Start time of segment (seconds)
             end_time: End time of segment (seconds)
             output_path: Path to output segment file
+            re_encode_video: If True, re-encode video for precise cuts. If False, use stream copy (faster)
         """
         import subprocess
         
@@ -339,31 +384,40 @@ class VideoProcessor:
         if duration <= 0:
             raise ValueError(f"Invalid segment duration: {duration:.6f}s (start: {start_time:.2f}s, end: {end_time:.2f}s). Duration must be positive.")
         
-        if duration < 0.1:
+        if duration < 0.01:
             raise ValueError(f"Segment duration too small: {duration:.6f}s. Minimum duration is 0.01s.")
         
         # Get audio track count to explicitly map each track
         num_audio_tracks = self.get_audio_track_count(input_path)
         
-        # Use FFmpeg with -ss after -i for more accurate seeking
-        # When -ss is before -i, FFmpeg seeks to nearest keyframe (fast but imprecise)
-        # When -ss is after -i, FFmpeg does frame-accurate seeking (slower but precise)
-        # We use frame-accurate seeking to prevent audio overlap at boundaries
+        # Use FFmpeg with -ss after -i for frame-accurate seeking
         cmd = [
             'ffmpeg',
             '-i', str(input_path),
             '-ss', str(start_time),  # Seek to start (after -i = frame-accurate seeking)
             '-t', str(duration),  # Duration to extract
-            '-map', '0:v',  # Map all video streams
+            '-map', '0:v',  # Map video stream
         ]
         
-        # Explicitly map each audio track individually to ensure preservation
+        if re_encode_video:
+            # Re-encode video to allow precise cuts at any frame position
+            video_codec, video_params = self._get_video_encoding_params(input_path)
+            cmd.extend(['-c:v', video_codec])
+            cmd.extend(video_params)
+        else:
+            # Use stream copy for speed (may have choppiness at cut points)
+            cmd.extend(['-c:v', 'copy'])
+        
+        # Explicitly map each audio track and copy (no re-encoding)
         for i in range(num_audio_tracks):
             cmd.extend(['-map', f'0:a:{i}'])
         
+        # Copy all audio streams (zero quality loss, zero processing time)
+        cmd.extend(['-c:a', 'copy'])
+        
+        # Handle timestamp issues
         cmd.extend([
-            '-c', 'copy',  # Stream copy (no re-encoding)
-            '-avoid_negative_ts', 'make_zero',  # Handle timestamp issues at boundaries
+            '-avoid_negative_ts', 'make_zero',
             '-y', str(output_path)
         ])
         
@@ -400,6 +454,7 @@ class VideoProcessor:
         end_time: float,
         temp_dir: Path,
         num_audio_tracks: int,
+        re_encode_video: bool = False,
         chunk_size: float = 5.0
     ) -> Path:
         """Extract a segment longer than chunk_size in multiple chunks.
@@ -413,6 +468,7 @@ class VideoProcessor:
             end_time: End time of segment (seconds)
             temp_dir: Temporary directory for chunk files
             num_audio_tracks: Number of audio tracks to preserve
+            re_encode_video: If True, re-encode video for precise cuts. If False, use stream copy
             chunk_size: Size of each chunk in seconds (default: 5.0)
             
         Returns:
@@ -433,7 +489,7 @@ class VideoProcessor:
                 chunk_duration = chunk_end - current_time
                 
                 chunk_file = temp_dir / f"chunk_{chunk_idx:04d}.mkv"
-                self._extract_segment(input_path, current_time, chunk_end, chunk_file)
+                self._extract_segment(input_path, current_time, chunk_end, chunk_file, re_encode_video)
                 chunk_files.append(chunk_file)
                 
                 current_time = chunk_end
@@ -576,6 +632,7 @@ class VideoProcessor:
         progress: Callable[[int, str], None],
         remove_space_between_sentences: bool = False,
         modifications: Optional[List[Dict[str, Any]]] = None,
+        re_encode_video: bool = False,
         chunk_size: float = 5.0
     ):
         """Remove specified segments from video, preserving all audio tracks.
@@ -696,11 +753,11 @@ class VideoProcessor:
                 try:
                     if seg_duration <= chunk_size:
                         # Extract directly (short segment)
-                        self._extract_segment(input_path, seg_start, seg_end, segment_file)
+                        self._extract_segment(input_path, seg_start, seg_end, segment_file, re_encode_video)
                     else:
                         # Extract in chunks (long segment)
                         segment_file = self._extract_segment_chunked(
-                            input_path, seg_start, seg_end, temp_dir, num_audio_tracks, chunk_size
+                            input_path, seg_start, seg_end, temp_dir, num_audio_tracks, re_encode_video, chunk_size
                         )
                     
                     # Verify segment file before adding to list
