@@ -72,6 +72,9 @@ class RenderWorker(QThread):
                 self.finished.emit(False, "Render cancelled")
                 return
             
+            # Process to temporary MKV file first (fast, no audio re-encoding)
+            temp_output = self.output_path.parent / f"{self.output_path.stem}_temp.mkv"
+            
             # Process video (we can't easily intercept progress from remove_segments,
             # so we'll estimate based on time)
             import time
@@ -79,7 +82,7 @@ class RenderWorker(QThread):
             
             processor.remove_segments(
                 self.input_path,
-                self.output_path,
+                temp_output,
                 self.segments_to_remove,
                 self.progress,
                 remove_space_between_sentences=self.remove_space_between_sentences,
@@ -89,8 +92,18 @@ class RenderWorker(QThread):
             )
             
             if self._cancelled:
+                temp_output.unlink(missing_ok=True)  # Clean up temp file
                 self.finished.emit(False, "Render cancelled")
                 return
+            
+            # Convert to MOV with CBR AAC and constant frame rate if output path is .mov
+            if self.output_path.suffix.lower() == '.mov':
+                self.progress.emit(95, "Converting to constant frame rate and CBR AAC audio")
+                processor._convert_to_mov(temp_output, self.output_path)
+                temp_output.unlink()  # Remove temporary MKV file
+            else:
+                # Output is MKV, just rename the temp file
+                temp_output.rename(self.output_path)
             
             self.progress.emit(100, "Rendering complete!")
             self.finished.emit(True, f"Video saved to: {self.output_path}")
@@ -871,7 +884,7 @@ class VideoReviewWindow(QMainWindow):
             return
         
         # Prompt for output file
-        default_output = self.video_path.parent / f"{self.video_path.stem}_processed{self.video_path.suffix}"
+        default_output = self.video_path.parent / f"{self.video_path.stem}_processed.mov"
         output_path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Processed Video",

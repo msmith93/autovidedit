@@ -103,7 +103,7 @@ def main():
         '--output',
         type=str,
         default=None,
-        help='Output video filename (default: {input}_processed.mkv)'
+        help='Output video filename (default: {input}_processed.mov)'
     )
     
     parser.add_argument(
@@ -162,7 +162,7 @@ def main():
         if not output_path.is_absolute():
             output_path = output_dir / output_path
     else:
-        output_path = output_dir / f"{input_path.stem}_processed{input_path.suffix}"
+        output_path = output_dir / f"{input_path.stem}_processed.mov"
     
     # Ensure output doesn't overwrite input
     if output_path.resolve() == input_path.resolve():
@@ -176,14 +176,14 @@ def main():
             original_video_path = input_path
             
             # Check if keyframe-optimized version exists in output directory (from preprocess.py)
-            optimized_video_path = output_dir / f"{input_path.stem}_keyframe_optimized{input_path.suffix}"
+            optimized_video_path = output_dir / f"{input_path.stem}_keyframe_optimized.mov"
             if optimized_video_path.exists():
                 print(f"Using keyframe-optimized video: {optimized_video_path}")
                 # Use optimized version for rendering (preserves all audio tracks)
                 original_video_path = optimized_video_path
             
             # Check if mixed audio file exists in output directory (from preprocess.py)
-            mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio{input_path.suffix}"
+            mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio.mov"
             
             if mixed_video_path.exists():
                 print(f"Using pre-mixed audio file: {mixed_video_path}")
@@ -199,7 +199,7 @@ def main():
                         print(f"Detected {len(audio_streams)} audio tracks. Mixing audio tracks...")
                         print("This may take a moment for large videos...")
                         
-                        mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio{input_path.suffix}"
+                        mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio.mov"
                         
                         # Mix all audio tracks using FFmpeg
                         stream = ffmpeg.input(str(input_path))
@@ -212,6 +212,7 @@ def main():
                             str(mixed_video_path),
                             vcodec='copy',
                             acodec='aac',
+                            audio_bitrate='192k',  # CBR AAC for Kdenlive compatibility
                             **{'y': None}
                         )
                         
@@ -258,28 +259,38 @@ def main():
         # Extract REMOVED segments
         removed_segments = extract_removed_segments(modifications)
         
+        # Process to temporary MKV file first (fast, no audio re-encoding)
+        temp_output = output_dir / f"{input_path.stem}_processed_temp.mkv"
+        
         if not removed_segments:
             print("\nWarning: No REMOVED segments found in JSON file.")
             print("Video will be copied without modification.")
             processor = VideoProcessor()
-            processor._copy_video(input_path, output_path)
+            processor._copy_video(input_path, temp_output)
+        else:
+            print(f"Found {len(removed_segments)} segment(s) to remove:")
+            total_removed = 0.0
+            for start, end in removed_segments:
+                duration = end - start
+                total_removed += duration
+                print(f"  {start:.2f}s - {end:.2f}s ({duration:.2f}s)")
+            print(f"\nTotal duration to remove: {total_removed:.2f} seconds")
+            
+            # Process video
+            print("\nApplying edits to video...")
+            processor = VideoProcessor()
+            processor.remove_segments(input_path, temp_output, removed_segments, chunk_size=args.chunk_size)
+        
+        # Convert to MOV with CBR AAC if output path is .mov
+        if output_path.suffix.lower() == '.mov':
+            print("\nConverting to MOV format with CBR AAC audio for Kdenlive compatibility...")
+            processor._convert_to_mov(temp_output, output_path)
+            temp_output.unlink()  # Remove temporary MKV file
             print(f"\nDone! Output saved to: {output_path}")
-            return
-        
-        print(f"Found {len(removed_segments)} segment(s) to remove:")
-        total_removed = 0.0
-        for start, end in removed_segments:
-            duration = end - start
-            total_removed += duration
-            print(f"  {start:.2f}s - {end:.2f}s ({duration:.2f}s)")
-        print(f"\nTotal duration to remove: {total_removed:.2f} seconds")
-        
-        # Process video
-        print("\nApplying edits to video...")
-        processor = VideoProcessor()
-        processor.remove_segments(input_path, output_path, removed_segments, chunk_size=args.chunk_size)
-        
-        print(f"\nDone! Output saved to: {output_path}")
+        else:
+            # Output is MKV, just rename the temp file
+            temp_output.rename(output_path)
+            print(f"\nDone! Output saved to: {output_path}")
         
     except KeyboardInterrupt:
         print("\n\nProcessing interrupted by user", file=sys.stderr)

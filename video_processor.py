@@ -768,6 +768,23 @@ class VideoProcessor:
                         raise RuntimeError(f"Segment file is empty: {segment_file}")
                     
                     segment_files.append(segment_file)
+                except ValueError as e:
+                    # Check if this is a segment duration error - skip with warning
+                    error_msg = str(e)
+                    if "Segment duration too small" in error_msg or "Invalid segment duration" in error_msg:
+                        print(f"  Warning: Skipping segment {curr_segment}/{total_segments} due to duration issue: {error_msg}")
+                        # Clean up any partial files
+                        if segment_file.exists():
+                            segment_file.unlink(missing_ok=True)
+                        continue  # Skip this segment and continue processing
+                    else:
+                        # Other ValueError - re-raise
+                        if segment_file.exists():
+                            segment_file.unlink(missing_ok=True)
+                        raise RuntimeError(
+                            f"Failed to extract segment {curr_segment}/{total_segments} "
+                            f"({seg_start:.2f}s - {seg_end:.2f}s): {e}"
+                        )
                 except Exception as e:
                     # Clean up any partial files
                     if segment_file.exists():
@@ -858,6 +875,82 @@ class VideoProcessor:
         finally:
             concat_file.unlink(missing_ok=True)
     
+    
+    def _convert_to_mov(self, input_path: Path, output_path: Path):
+        """Convert video file from MKV to MOV format with CBR AAC audio and constant frame rate.
+        
+        Re-encodes video with constant frame rate and re-encodes audio to CBR AAC for Kdenlive compatibility.
+        This fixes VFR issues and VBR/timestamp drift issues that cause audio crackling.
+        
+        Args:
+            input_path: Source video path (typically MKV)
+            output_path: Destination video path (should have .mov extension)
+            
+        Raises:
+            RuntimeError: If conversion fails
+        """
+        import subprocess
+        
+        # Get video properties to determine frame rate
+        try:
+            probe = ffmpeg.probe(str(input_path))
+            video_stream = next((s for s in probe.get('streams', []) if s.get('codec_type') == 'video'), None)
+            
+            if not video_stream:
+                raise RuntimeError(f"Could not find video stream in: {input_path}")
+            
+            # Detect frame rate - prefer r_frame_rate (display frame rate), fall back to avg_frame_rate
+            frame_rate_str = video_stream.get('r_frame_rate') or video_stream.get('avg_frame_rate')
+            if frame_rate_str and frame_rate_str != '0/0' and frame_rate_str != 'N/A':
+                # Parse fraction (e.g., "30000/1001" = 29.97fps) and round to nearest integer
+                try:
+                    num, den = map(int, frame_rate_str.split('/'))
+                    frame_rate = round(num / den) if den > 0 else 30
+                except (ValueError, ZeroDivisionError):
+                    frame_rate = 30
+            else:
+                # Default to 30fps if can't detect
+                frame_rate = 30
+        except Exception:
+            # Default to 30fps if detection fails
+            frame_rate = 30
+        
+        # Get encoding parameters (uses GPU if available)
+        video_codec, video_params = self._get_video_encoding_params(input_path)
+        
+        # Get audio track count to explicitly map each track
+        num_audio_tracks = self.get_audio_track_count(input_path)
+        
+        cmd = [
+            'ffmpeg',
+            '-i', str(input_path),
+            '-map', '0:v',  # Map video stream
+        ]
+        
+        # Explicitly map each audio track
+        for i in range(num_audio_tracks):
+            cmd.extend(['-map', f'0:a:{i}'])
+        
+        # Re-encode video with constant frame rate, re-encode audio to CBR AAC
+        cmd.extend(['-c:v', video_codec])
+        cmd.extend(video_params)
+        cmd.extend([
+            '-r', str(frame_rate),  # Set output frame rate
+            '-vsync', 'cfr',  # Constant frame rate mode
+            '-c:a', 'aac', '-b:a', '192k',  # Re-encode audio to CBR AAC
+            '-y', str(output_path)
+        ])
+        
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr if result.stderr else "Unknown error"
+            raise RuntimeError(f"Failed to convert video to MOV: {error_msg}")
     
     def _copy_video(self, input_path: Path, output_path: Path):
         """Copy video file without modification, preserving all tracks.

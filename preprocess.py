@@ -71,7 +71,7 @@ def main():
         '--output',
         type=str,
         default=None,
-        help='Output video filename (default: {input}_processed.mkv)'
+        help='Output video filename (default: {input}_processed.mov)'
     )
     
     parser.add_argument(
@@ -127,7 +127,7 @@ def main():
         if not output_path.is_absolute():
             output_path = output_dir / output_path
     else:
-        output_path = output_dir / f"{input_path.stem}_processed{input_path.suffix}"
+        output_path = output_dir / f"{input_path.stem}_processed.mov"
     
     if args.json_output:
         json_path = Path(args.json_output)
@@ -150,7 +150,7 @@ def main():
             print(f"Detected {len(audio_streams)} audio tracks. Mixing audio tracks...")
             print("This may take a moment for large videos...")
             
-            mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio{input_path.suffix}"
+            mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio.mov"
             
             # Mix all audio tracks using FFmpeg
             stream = ffmpeg.input(str(input_path))
@@ -163,6 +163,7 @@ def main():
                 str(mixed_video_path),
                 vcodec='copy',
                 acodec='aac',
+                audio_bitrate='192k',  # CBR AAC for Kdenlive compatibility
                 **{'y': None}
             )
             
@@ -189,7 +190,7 @@ def main():
         
         try:
             processor_optimize = VideoProcessor()
-            optimized_video_path = output_dir / f"{input_path.stem}_keyframe_optimized{input_path.suffix}"
+            optimized_video_path = output_dir / f"{input_path.stem}_keyframe_optimized.mov"
             
             def progress_callback(message: str):
                 print(f"  {message}")
@@ -287,15 +288,27 @@ def main():
                 print("Error: Output file cannot be the same as input file", file=sys.stderr)
                 sys.exit(1)
             
+            # Process to temporary MKV file first (fast, no audio re-encoding)
+            temp_output = output_dir / f"{input_path.stem}_processed_temp.mkv"
+            
             if not silence_segments:
                 print("\nNo silence detected. Video will be copied without modification.")
-                processor._copy_video(mixed_video_path, output_path)
-                print(f"Done! Output saved to: {output_path}")
+                processor._copy_video(mixed_video_path, temp_output)
             else:
                 # Process video (use mixed video if available)
                 print("\nRemoving segments from video...")
-                processor.remove_segments(mixed_video_path, output_path, silence_segments)
-                print(f"\nDone! Output saved to: {output_path}")
+                processor.remove_segments(mixed_video_path, temp_output, silence_segments)
+            
+            # Convert to MOV with CBR AAC if output path is .mov
+            if output_path.suffix.lower() == '.mov':
+                print("\nConverting to MOV format with CBR AAC audio for Kdenlive compatibility...")
+                processor._convert_to_mov(temp_output, output_path)
+                temp_output.unlink()  # Remove temporary MKV file
+                print(f"Done! Output saved to: {output_path}")
+            else:
+                # Output is MKV, just rename the temp file
+                temp_output.rename(output_path)
+                print(f"Done! Output saved to: {output_path}")
         else:
             print("\nVideo encoding skipped (use --encode-video to enable)")
             print(f"Review the JSON log at: {json_path}")
