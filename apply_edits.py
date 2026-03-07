@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
-"""Script to apply video edits based on JSON modifications file."""
+"""Launch video editing UI for reviewing and editing video based on JSON modifications file."""
 
 import argparse
-import json
 import sys
 from pathlib import Path
-from typing import List, Tuple
-
-from video_processor import VideoProcessor
 
 
 def validate_input_file(input_path: Path):
@@ -31,58 +27,10 @@ def validate_input_file(input_path: Path):
         print(f"Warning: File extension '{input_path.suffix}' may not be a video format", file=sys.stderr)
 
 
-def load_json_modifications(json_path: Path) -> List[dict]:
-    """Load modifications from JSON file.
-    
-    Args:
-        json_path: Path to JSON modifications file
-        
-    Returns:
-        List of modification dictionaries
-        
-    Raises:
-        FileNotFoundError: If JSON file doesn't exist
-        ValueError: If JSON file is invalid
-    """
-    if not json_path.exists():
-        raise FileNotFoundError(f"JSON modifications file not found: {json_path}")
-    
-    try:
-        with open(json_path, 'r') as f:
-            modifications = json.load(f)
-        
-        if not isinstance(modifications, list):
-            raise ValueError(f"JSON file must contain a list of modifications, got {type(modifications)}")
-        
-        return modifications
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON file: {e}")
-
-
-def extract_removed_segments(modifications: List[dict]) -> List[Tuple[float, float]]:
-    """Extract REMOVED segments from modifications list.
-    
-    Args:
-        modifications: List of modification dictionaries
-        
-    Returns:
-        List of (start_time, end_time) tuples for REMOVED entries
-    """
-    removed_segments = []
-    
-    for mod in modifications:
-        if mod.get('modification') == 'REMOVED':
-            start_time = float(mod.get('start_time', 0.0))
-            end_time = float(mod.get('end_time', 0.0))
-            removed_segments.append((start_time, end_time))
-    
-    return removed_segments
-
-
 def main():
     """Main entry point for the script."""
     parser = argparse.ArgumentParser(
-        description='Apply video edits based on JSON modifications file',
+        description='Launch video editing UI for reviewing and editing video',
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     
@@ -97,27 +45,6 @@ def main():
         type=str,
         default=None,
         help='JSON modifications file (default: {input}_modifications.json)'
-    )
-    
-    parser.add_argument(
-        '--output',
-        type=str,
-        default=None,
-        help='Output video filename (default: {input}_processed.mov)'
-    )
-    
-    parser.add_argument(
-        '--chunk-size',
-        type=float,
-        default=5.0,
-        help='Size of chunks in seconds for extracting long segments (default: 5.0)'
-    )
-    
-    parser.add_argument(
-        '--ui',
-        action='store_true',
-        default=False,
-        help='Launch GUI for video review and editing (default: False)'
     )
     
     args = parser.parse_args()
@@ -137,8 +64,6 @@ def main():
     output_dir = project_dir / f"{input_path.stem}_preprocessed"
     output_dir.mkdir(exist_ok=True)
     
-    print(f"Output directory: {output_dir}")
-    
     # Determine JSON input path
     if args.json_input:
         json_path = Path(args.json_input)
@@ -156,147 +81,77 @@ def main():
         else:
             json_path = input_path.parent / default_json
     
-    # Determine output path (in output directory)
-    if args.output:
-        output_path = Path(args.output)
-        if not output_path.is_absolute():
-            output_path = output_dir / output_path
-    else:
-        output_path = output_dir / f"{input_path.stem}_processed.mov"
-    
-    # Ensure output doesn't overwrite input
-    if output_path.resolve() == input_path.resolve():
-        print("Error: Output file cannot be the same as input file", file=sys.stderr)
-        sys.exit(1)
-    
-    # If UI flag is set, launch GUI instead of CLI processing
-    if args.ui:
-        try:
-            # Store original video path before any mixing
-            original_video_path = input_path
-            
-            # Check if keyframe-optimized version exists in output directory (from preprocess.py)
-            optimized_video_path = output_dir / f"{input_path.stem}_keyframe_optimized.mov"
-            if optimized_video_path.exists():
-                print(f"Using keyframe-optimized video: {optimized_video_path}")
-                # Use optimized version for rendering (preserves all audio tracks)
-                original_video_path = optimized_video_path
-            
-            # Check if mixed audio file exists in output directory (from preprocess.py)
-            mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio.mov"
-            
-            if mixed_video_path.exists():
-                print(f"Using pre-mixed audio file: {mixed_video_path}")
-                mixed_video_path_for_ui = mixed_video_path
-            else:
-                # Fallback: Check if video has multiple audio tracks and mix them if needed
-                import ffmpeg
-                try:
-                    probe = ffmpeg.probe(str(input_path))
-                    audio_streams = [s for s in probe.get('streams', []) if s.get('codec_type') == 'audio']
-                    
-                    if len(audio_streams) > 1:
-                        print(f"Detected {len(audio_streams)} audio tracks. Mixing audio tracks...")
-                        print("This may take a moment for large videos...")
-                        
-                        mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio.mov"
-                        
-                        # Mix all audio tracks using FFmpeg
-                        stream = ffmpeg.input(str(input_path))
-                        audio_inputs = [stream[f'a:{i}'] for i in range(len(audio_streams))]
-                        mixed_audio = ffmpeg.filter(audio_inputs, 'amix', inputs=len(audio_inputs))
-                        
-                        output = ffmpeg.output(
-                            stream.video,
-                            mixed_audio,
-                            str(mixed_video_path),
-                            vcodec='copy',
-                            acodec='aac',
-                            audio_bitrate='192k',  # CBR AAC for Kdenlive compatibility
-                            **{'y': None}
-                        )
-                        
-                        ffmpeg.run(output, quiet=False, overwrite_output=True)  # Show progress
-                        
-                        print(f"Audio mixing complete. Mixed video saved to: {mixed_video_path}")
-                        mixed_video_path_for_ui = mixed_video_path
-                    else:
-                        # Only one track, no mixing needed
-                        mixed_video_path_for_ui = original_video_path
-                except Exception as e:
-                    print(f"Warning: Could not mix audio tracks: {e}. Using original file.", file=sys.stderr)
-                    mixed_video_path_for_ui = original_video_path
-            
-            from PySide6.QtWidgets import QApplication
-            from video_review_ui import VideoReviewWindow
-            
-            app = QApplication(sys.argv)
-            window = VideoReviewWindow(mixed_video_path_for_ui, json_path, original_video_path)
-            window.show()
-            # Load video after window is shown so VLC can embed properly
-            window._load_video()
-            sys.exit(app.exec())
-        except ImportError as e:
-            print(f"Error: Required packages not installed. Install with: pip install -r requirements.txt", file=sys.stderr)
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error launching UI: {e}", file=sys.stderr)
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
-    
-    print(f"Input video: {input_path}")
-    print(f"JSON modifications: {json_path}")
-    print(f"Output video: {output_path}")
-    print()
-    
+    # Launch GUI
     try:
-        # Load JSON modifications
-        print("Loading JSON modifications file...")
-        modifications = load_json_modifications(json_path)
-        print(f"Loaded {len(modifications)} modification(s)")
+        # Store original video path before any mixing
+        original_video_path = input_path
         
-        # Extract REMOVED segments
-        removed_segments = extract_removed_segments(modifications)
+        # Check if keyframe-optimized version exists in output directory (from preprocess.py)
+        optimized_video_path = output_dir / f"{input_path.stem}_keyframe_optimized.mov"
+        if optimized_video_path.exists():
+            print(f"Using keyframe-optimized video: {optimized_video_path}")
+            # Use optimized version for rendering (preserves all audio tracks)
+            original_video_path = optimized_video_path
         
-        # Process to temporary MKV file first (fast, no audio re-encoding)
-        temp_output = output_dir / f"{input_path.stem}_processed_temp.mkv"
+        # Check if mixed audio file exists in output directory (from preprocess.py)
+        mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio.mov"
         
-        if not removed_segments:
-            print("\nWarning: No REMOVED segments found in JSON file.")
-            print("Video will be copied without modification.")
-            processor = VideoProcessor()
-            processor._copy_video(input_path, temp_output)
+        if mixed_video_path.exists():
+            print(f"Using pre-mixed audio file: {mixed_video_path}")
+            mixed_video_path_for_ui = mixed_video_path
         else:
-            print(f"Found {len(removed_segments)} segment(s) to remove:")
-            total_removed = 0.0
-            for start, end in removed_segments:
-                duration = end - start
-                total_removed += duration
-                print(f"  {start:.2f}s - {end:.2f}s ({duration:.2f}s)")
-            print(f"\nTotal duration to remove: {total_removed:.2f} seconds")
-            
-            # Process video
-            print("\nApplying edits to video...")
-            processor = VideoProcessor()
-            processor.remove_segments(input_path, temp_output, removed_segments, chunk_size=args.chunk_size)
+            # Fallback: Check if video has multiple audio tracks and mix them if needed
+            import ffmpeg
+            try:
+                probe = ffmpeg.probe(str(input_path))
+                audio_streams = [s for s in probe.get('streams', []) if s.get('codec_type') == 'audio']
+                
+                if len(audio_streams) > 1:
+                    print(f"Detected {len(audio_streams)} audio tracks. Mixing audio tracks...")
+                    print("This may take a moment for large videos...")
+                    
+                    mixed_video_path = output_dir / f"{input_path.stem}_mixed_audio.mov"
+                    
+                    # Mix all audio tracks using FFmpeg
+                    stream = ffmpeg.input(str(input_path))
+                    audio_inputs = [stream[f'a:{i}'] for i in range(len(audio_streams))]
+                    mixed_audio = ffmpeg.filter(audio_inputs, 'amix', inputs=len(audio_inputs))
+                    
+                    output = ffmpeg.output(
+                        stream.video,
+                        mixed_audio,
+                        str(mixed_video_path),
+                        vcodec='copy',
+                        acodec='aac',
+                        audio_bitrate='192k',  # CBR AAC for Kdenlive compatibility
+                        **{'y': None}
+                    )
+                    
+                    ffmpeg.run(output, quiet=False, overwrite_output=True)  # Show progress
+                    
+                    print(f"Audio mixing complete. Mixed video saved to: {mixed_video_path}")
+                    mixed_video_path_for_ui = mixed_video_path
+                else:
+                    # Only one track, no mixing needed
+                    mixed_video_path_for_ui = original_video_path
+            except Exception as e:
+                print(f"Warning: Could not mix audio tracks: {e}. Using original file.", file=sys.stderr)
+                mixed_video_path_for_ui = original_video_path
         
-        # Convert to MOV with CBR AAC if output path is .mov
-        if output_path.suffix.lower() == '.mov':
-            print("\nConverting to MOV format with CBR AAC audio for Kdenlive compatibility...")
-            processor._convert_to_mov(temp_output, output_path)
-            temp_output.unlink()  # Remove temporary MKV file
-            print(f"\nDone! Output saved to: {output_path}")
-        else:
-            # Output is MKV, just rename the temp file
-            temp_output.rename(output_path)
-            print(f"\nDone! Output saved to: {output_path}")
+        from PySide6.QtWidgets import QApplication
+        from video_review_ui import VideoReviewWindow
         
-    except KeyboardInterrupt:
-        print("\n\nProcessing interrupted by user", file=sys.stderr)
+        app = QApplication(sys.argv)
+        window = VideoReviewWindow(mixed_video_path_for_ui, json_path, original_video_path)
+        window.show()
+        # Load video after window is shown so VLC can embed properly
+        window._load_video()
+        sys.exit(app.exec())
+    except ImportError as e:
+        print(f"Error: Required packages not installed. Install with: pip install -r requirements.txt", file=sys.stderr)
         sys.exit(1)
     except Exception as e:
-        print(f"\nError: {e}", file=sys.stderr)
+        print(f"Error launching UI: {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
         sys.exit(1)

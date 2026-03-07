@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QMenuBar, QMenu, QToolBar, QStatusBar, QDialog, QDialogButtonBox, QCheckBox
 )
 from PySide6.QtCore import Qt, QUrl, Signal, QThread, QTimer, QSize
-from PySide6.QtGui import QAction, QKeySequence, QShortcut
+from PySide6.QtGui import QAction, QKeySequence, QShortcut, QBrush, QColor
 import vlc
 import platform
 
@@ -167,6 +167,179 @@ class SentenceItem(QListWidgetItem):
         font = self.font()
         font.setStrikeOut(False)
         self.setFont(font)
+    
+    def set_overlap_warning(self, has_warning: bool):
+        """Set yellow highlight to warn about overlap impact."""
+        if has_warning and not self.is_removed:
+            self.setBackground(QBrush(QColor(255, 255, 0, 100)))  # Semi-transparent yellow
+        else:
+            self.setBackground(QBrush())  # Clear background
+
+
+class InBetweenItem(QListWidgetItem):
+    """Custom list item for in-between (gap) time spans."""
+    
+    def __init__(self, start_time: float, end_time: float, parent=None):
+        super().__init__(parent)
+        self.start_time = start_time
+        self.end_time = end_time
+        self.is_enabled = False  # Disabled by default (will be removed)
+        
+        # Format timestamp
+        timestamp = self._format_time(start_time)
+        duration = end_time - start_time
+        
+        # Set display text
+        display_text = f"[{timestamp}] GAP ({duration:.1f}s)"
+        self.setText(display_text)
+        
+        # Visual styling for disabled gaps (grayed out)
+        self._update_styling()
+    
+    def _format_time(self, seconds: float) -> str:
+        """Format seconds as MM:SS or HH:MM:SS."""
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
+    
+    def _update_styling(self):
+        """Update visual styling based on enabled state."""
+        if self.is_enabled:
+            # Enabled = keep in video (normal styling)
+            self.setForeground(Qt.GlobalColor.darkGreen)
+            font = self.font()
+            font.setItalic(True)
+            font.setStrikeOut(False)
+            self.setFont(font)
+        else:
+            # Disabled = remove from video (grayed out with strikeout)
+            self.setForeground(Qt.GlobalColor.gray)
+            font = self.font()
+            font.setItalic(True)
+            font.setStrikeOut(True)
+            self.setFont(font)
+    
+    def enable(self):
+        """Enable this gap (keep in final video)."""
+        self.is_enabled = True
+        self._update_styling()
+    
+    def disable(self):
+        """Disable this gap (remove from final video)."""
+        self.is_enabled = False
+        self._update_styling()
+
+
+def calculate_in_between_spans(
+    sentences: List[Dict[str, Any]], 
+    video_duration: Optional[float] = None,
+    padding: float = 0.2
+) -> List[Tuple[float, float]]:
+    """Calculate time spans where no audio track has an active sentence.
+    
+    Merges all sentences from both tracks into a unified timeline,
+    then identifies gaps between the merged segments.
+    
+    Note: Gaps are calculated based on ALL sentences regardless of removal status.
+    A gap represents a time period where no sentence exists on any track.
+    Padding (default 0.2s) is applied around each sentence to eliminate very small gaps.
+    
+    Args:
+        sentences: List of sentence modification dictionaries
+        video_duration: Optional video duration to include final gap
+        padding: Padding in seconds to add before and after each sentence (default: 0.2)
+        
+    Returns:
+        List of (start_time, end_time) tuples for gaps between sentences
+    """
+    if not sentences:
+        return []
+    
+    # Extract sentence time ranges (ALL sentences, regardless of removal status)
+    # Gaps represent periods where no sentence exists, not periods where no enabled sentence exists
+    # Apply padding around each sentence to eliminate very small gaps
+    sentence_ranges = []
+    for sent in sentences:
+        if sent.get('reason') == 'Sentence':
+            start = float(sent.get('start_time', 0.0))
+            end = float(sent.get('end_time', 0.0))
+            if end > start:
+                # Apply padding: extend sentence range by padding seconds on each side
+                padded_start = max(0.0, start - padding)
+                padded_end = end + padding
+                sentence_ranges.append((padded_start, padded_end))
+    
+    if not sentence_ranges:
+        return []
+    
+    # Sort by start time
+    sentence_ranges.sort(key=lambda x: x[0])
+    
+    # Merge overlapping sentences across all tracks
+    merged = [sentence_ranges[0]]
+    for current_start, current_end in sentence_ranges[1:]:
+        last_start, last_end = merged[-1]
+        
+        # If current sentence overlaps or is adjacent to the last merged sentence
+        if current_start <= last_end:
+            # Merge by extending the end time
+            merged[-1] = (last_start, max(last_end, current_end))
+        else:
+            # No overlap, add as new segment
+            merged.append((current_start, current_end))
+    
+    # Calculate gaps between merged sentences (which are already padded)
+    gaps = []
+    for i in range(len(merged) - 1):
+        gap_start = merged[i][1]
+        gap_end = merged[i + 1][0]
+        if gap_end > gap_start:
+            gaps.append((gap_start, gap_end))
+    
+    # Optionally add gap at the end if video_duration is provided
+    if video_duration and merged:
+        last_end = merged[-1][1]
+        if video_duration > last_end:
+            gaps.append((last_end, video_duration))
+    
+    # Optionally add gap at the beginning if first sentence doesn't start at 0
+    if merged and merged[0][0] > 0:
+        gaps.insert(0, (0.0, merged[0][0]))
+    
+    return gaps
+
+
+def find_overlapping_sentences(
+    sentences: List['SentenceItem']
+) -> Dict[int, List[int]]:
+    """Find sentences that overlap with sentences from different audio tracks.
+    
+    Args:
+        sentences: List of SentenceItem objects
+        
+    Returns:
+        Dictionary mapping sentence index to list of overlapping sentence indices
+        (from different audio tracks)
+    """
+    overlaps: Dict[int, List[int]] = {}
+    
+    for i, sent_a in enumerate(sentences):
+        overlaps[i] = []
+        for j, sent_b in enumerate(sentences):
+            if i == j:
+                continue
+            # Check if different tracks and time ranges overlap
+            if sent_a.audio_track != sent_b.audio_track:
+                # Check for overlap: A.start < B.end AND B.start < A.end
+                if sent_a.start_time < sent_b.end_time and sent_b.start_time < sent_a.end_time:
+                    overlaps[i].append(j)
+    
+    return overlaps
 
 
 class VideoPlayerWidget(QWidget):
@@ -182,6 +355,7 @@ class VideoPlayerWidget(QWidget):
             '--intf', 'dummy',  # No interface
             '--no-video-title-show',  # Don't show title
             '--quiet',  # Suppress VLC output
+            '--vout', 'xcb_window',  # Force X11 embedded window output for Qt embedding
         ]
         
         self.vlc_instance = vlc.Instance(vlc_args)
@@ -204,7 +378,10 @@ class VideoPlayerWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         
         # Create widget to hold VLC video output
+        # WA_NativeWindow ensures a real X11 window ID for VLC embedding
         self.video_widget = QWidget()
+        self.video_widget.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.video_widget.setStyleSheet("background-color: black;")
         layout.addWidget(self.video_widget)
         
         self.setLayout(layout)
@@ -328,16 +505,19 @@ class VideoPlayerWidget(QWidget):
 
 
 class SentenceListWidget(QListWidget):
-    """Widget for displaying and managing sentences."""
+    """Widget for displaying and managing sentences and in-between gaps."""
     
     sentence_clicked = Signal(float)  # start_time in seconds
-    sentence_modified = Signal()  # emitted when a sentence is marked/unmarked
+    sentence_modified = Signal()  # emitted when a sentence/gap is marked/unmarked
     
     def __init__(self, parent=None):
         super().__init__(parent)
         self.sentences: List[SentenceItem] = []
+        self.gaps: List[InBetweenItem] = []
+        self.all_items: List[QListWidgetItem] = []  # Combined list for display
         self.current_sentence_index = -1
         self._has_unsaved_changes = False
+        self._overlap_map: Dict[int, List[int]] = {}  # Maps sentence index to overlapping indices
         
         # Enable multi-selection (Ctrl+Click for individual, Shift+Click for range)
         self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -346,10 +526,12 @@ class SentenceListWidget(QListWidget):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)
     
-    def load_sentences(self, modifications: List[Dict[str, Any]]):
-        """Load sentences from modifications list."""
+    def load_sentences(self, modifications: List[Dict[str, Any]], video_duration: Optional[float] = None):
+        """Load sentences and calculate in-between gaps from modifications list."""
         self.clear()
         self.sentences = []
+        self.gaps = []
+        self.all_items = []
         self._has_unsaved_changes = False
         
         # Filter for sentences only
@@ -361,62 +543,117 @@ class SentenceListWidget(QListWidget):
         # Sort by start_time
         sentence_mods.sort(key=lambda x: float(x.get('start_time', 0.0)))
         
+        # Create sentence items
         for mod in sentence_mods:
             item = SentenceItem(mod)
             self.sentences.append(item)
+        
+        # Calculate overlap map for sentences
+        self._overlap_map = find_overlapping_sentences(self.sentences)
+        
+        # Calculate in-between gaps (only from non-removed sentences for gap calculation)
+        gap_ranges = calculate_in_between_spans(sentence_mods, video_duration)
+        for gap_start, gap_end in gap_ranges:
+            gap_item = InBetweenItem(gap_start, gap_end)
+            self.gaps.append(gap_item)
+        
+        # Combine and sort all items chronologically by start time
+        combined: List[Tuple[float, QListWidgetItem]] = []
+        for sent in self.sentences:
+            combined.append((sent.start_time, sent))
+        for gap in self.gaps:
+            combined.append((gap.start_time, gap))
+        
+        combined.sort(key=lambda x: x[0])
+        
+        # Add items to widget in sorted order
+        for _, item in combined:
+            self.all_items.append(item)
             self.addItem(item)
     
-    def _on_item_clicked(self, item: SentenceItem):
-        """Handle sentence click - seek to timestamp (unless modifier keys are pressed for multi-select)."""
+    def _on_item_clicked(self, item: QListWidgetItem):
+        """Handle item click - seek to timestamp (unless modifier keys are pressed for multi-select)."""
         # Get current keyboard modifiers
         modifiers = QApplication.keyboardModifiers()
         
         # Only seek to timestamp if no modifier keys are pressed (single click without Ctrl/Shift)
         # This allows multi-select to work without interfering with video seeking
         if modifiers == Qt.KeyboardModifier.NoModifier:
-            self.sentence_clicked.emit(item.start_time)
+            if isinstance(item, SentenceItem):
+                self.sentence_clicked.emit(item.start_time)
+            elif isinstance(item, InBetweenItem):
+                self.sentence_clicked.emit(item.start_time)
             self._center_item(item)
     
-    def _center_item(self, item: SentenceItem):
+    def _center_item(self, item: QListWidgetItem):
         """Center the clicked item in the view."""
         index = self.row(item)
         self.scrollToItem(item, QListWidget.ScrollHint.PositionAtCenter)
         self.setCurrentItem(item)
     
     def _show_context_menu(self, position):
-        """Show context menu for sentence actions."""
+        """Show context menu for sentence/gap actions."""
         selected_items = self.selectedItems()
         
-        # Filter to only SentenceItem instances
+        # Separate sentences and gaps
         selected_sentences = [item for item in selected_items if isinstance(item, SentenceItem)]
+        selected_gaps = [item for item in selected_items if isinstance(item, InBetweenItem)]
         
         menu = QMenu(self)
         
+        # Handle sentence selection
         if len(selected_sentences) > 1:
-            # Multiple selection - show both actions
-            mark_action = menu.addAction(f"Mark {len(selected_sentences)} selected for removal")
-            unmark_action = menu.addAction(f"Unmark {len(selected_sentences)} selected for removal")
+            # Multiple sentence selection - show both actions
+            mark_action = menu.addAction(f"Mark {len(selected_sentences)} sentences for removal")
+            unmark_action = menu.addAction(f"Unmark {len(selected_sentences)} sentences for removal")
             mark_action.triggered.connect(self._mark_selected_sentences)
             unmark_action.triggered.connect(self._unmark_selected_sentences)
-        elif len(selected_sentences) == 1:
-            # Single selection - show appropriate action based on state
+        elif len(selected_sentences) == 1 and not selected_gaps:
+            # Single sentence selection - show appropriate action based on state
             item = selected_sentences[0]
             if item.is_removed:
-                unmark_action = menu.addAction("Unmark for removal")
+                unmark_action = menu.addAction("Unmark sentence for removal")
                 unmark_action.triggered.connect(lambda: self._unmark_sentence(item))
             else:
-                mark_action = menu.addAction("Mark for removal")
+                mark_action = menu.addAction("Mark sentence for removal")
                 mark_action.triggered.connect(lambda: self._mark_sentence(item))
-        else:
-            # No selection - try to get item at position
+        
+        # Handle gap selection
+        if len(selected_gaps) > 1:
+            # Multiple gap selection
+            if selected_sentences:
+                menu.addSeparator()
+            enable_action = menu.addAction(f"Enable {len(selected_gaps)} gaps (keep in video)")
+            disable_action = menu.addAction(f"Disable {len(selected_gaps)} gaps (remove from video)")
+            enable_action.triggered.connect(self._enable_selected_gaps)
+            disable_action.triggered.connect(self._disable_selected_gaps)
+        elif len(selected_gaps) == 1 and not selected_sentences:
+            # Single gap selection
+            gap = selected_gaps[0]
+            if gap.is_enabled:
+                disable_action = menu.addAction("Disable gap (remove from video)")
+                disable_action.triggered.connect(lambda: self._disable_gap(gap))
+            else:
+                enable_action = menu.addAction("Enable gap (keep in video)")
+                enable_action.triggered.connect(lambda: self._enable_gap(gap))
+        
+        # If no items selected, try to get item at position
+        if not selected_sentences and not selected_gaps:
             item = self.itemAt(position)
             if isinstance(item, SentenceItem):
                 if item.is_removed:
-                    unmark_action = menu.addAction("Unmark for removal")
+                    unmark_action = menu.addAction("Unmark sentence for removal")
                     unmark_action.triggered.connect(lambda: self._unmark_sentence(item))
                 else:
-                    mark_action = menu.addAction("Mark for removal")
+                    mark_action = menu.addAction("Mark sentence for removal")
                     mark_action.triggered.connect(lambda: self._mark_sentence(item))
+            elif isinstance(item, InBetweenItem):
+                if item.is_enabled:
+                    disable_action = menu.addAction("Disable gap (remove from video)")
+                    disable_action.triggered.connect(lambda: self._disable_gap(item))
+                else:
+                    enable_action = menu.addAction("Enable gap (keep in video)")
+                    enable_action.triggered.connect(lambda: self._enable_gap(item))
             else:
                 return  # No valid item
         
@@ -425,6 +662,7 @@ class SentenceListWidget(QListWidget):
     def _mark_sentence(self, item: SentenceItem):
         """Mark a sentence for removal."""
         item.mark_for_removal()
+        self._update_overlap_warnings()
         self.itemChanged.emit(item)
         self._has_unsaved_changes = True
         self._notify_parent_of_changes()
@@ -432,6 +670,7 @@ class SentenceListWidget(QListWidget):
     def _unmark_sentence(self, item: SentenceItem):
         """Unmark a sentence for removal."""
         item.unmark_for_removal()
+        self._update_overlap_warnings()
         self.itemChanged.emit(item)
         self._has_unsaved_changes = True
         self._notify_parent_of_changes()
@@ -447,6 +686,7 @@ class SentenceListWidget(QListWidget):
                 self.itemChanged.emit(item)
         
         if selected_sentences:
+            self._update_overlap_warnings()
             self._has_unsaved_changes = True
             self._notify_parent_of_changes()
     
@@ -461,31 +701,106 @@ class SentenceListWidget(QListWidget):
                 self.itemChanged.emit(item)
         
         if selected_sentences:
+            self._update_overlap_warnings()
             self._has_unsaved_changes = True
             self._notify_parent_of_changes()
+    
+    def _enable_gap(self, item: InBetweenItem):
+        """Enable a gap (keep in final video)."""
+        item.enable()
+        self.itemChanged.emit(item)
+        self._has_unsaved_changes = True
+        self._notify_parent_of_changes()
+    
+    def _disable_gap(self, item: InBetweenItem):
+        """Disable a gap (remove from final video)."""
+        item.disable()
+        self.itemChanged.emit(item)
+        self._has_unsaved_changes = True
+        self._notify_parent_of_changes()
+    
+    def _enable_selected_gaps(self):
+        """Enable all selected gaps."""
+        selected_items = self.selectedItems()
+        selected_gaps = [item for item in selected_items if isinstance(item, InBetweenItem)]
+        
+        for item in selected_gaps:
+            if not item.is_enabled:
+                item.enable()
+                self.itemChanged.emit(item)
+        
+        if selected_gaps:
+            self._has_unsaved_changes = True
+            self._notify_parent_of_changes()
+    
+    def _disable_selected_gaps(self):
+        """Disable all selected gaps."""
+        selected_items = self.selectedItems()
+        selected_gaps = [item for item in selected_items if isinstance(item, InBetweenItem)]
+        
+        for item in selected_gaps:
+            if item.is_enabled:
+                item.disable()
+                self.itemChanged.emit(item)
+        
+        if selected_gaps:
+            self._has_unsaved_changes = True
+            self._notify_parent_of_changes()
+    
+    def _update_overlap_warnings(self):
+        """Update yellow highlighting for sentences impacted by removed overlapping sentences."""
+        for i, sentence in enumerate(self.sentences):
+            has_warning = False
+            
+            # Check if any overlapping sentence from a different track is marked for removal
+            if i in self._overlap_map:
+                for overlap_idx in self._overlap_map[i]:
+                    if overlap_idx < len(self.sentences):
+                        overlapping_sentence = self.sentences[overlap_idx]
+                        # If the overlapping sentence is removed and this one isn't,
+                        # this sentence will be impacted
+                        if overlapping_sentence.is_removed and not sentence.is_removed:
+                            has_warning = True
+                            break
+            
+            sentence.set_overlap_warning(has_warning)
     
     def _notify_parent_of_changes(self):
         """Notify parent VideoReviewWindow of unsaved changes."""
         self.sentence_modified.emit()
     
     def highlight_sentence_at_time(self, current_time: float):
-        """Highlight the sentence that matches the current video time."""
-        # Find sentence that contains current_time
-        for i, item in enumerate(self.sentences):
-            if item.start_time <= current_time <= item.end_time:
-                if i != self.current_sentence_index:
-                    self.current_sentence_index = i
-                    # Clear previous selection
-                    for j in range(self.count()):
-                        self.item(j).setSelected(False)
-                    # Select current
-                    item.setSelected(True)
-                    # Auto-scroll if needed
-                    if not self.visualItemRect(item).intersects(self.viewport().rect()):
-                        self.scrollToItem(item, QListWidget.ScrollHint.EnsureVisible)
-                return
+        """Highlight the item (sentence or gap) that matches the current video time."""
+        # Find item that contains current_time
+        for i, item in enumerate(self.all_items):
+            if isinstance(item, SentenceItem):
+                if item.start_time <= current_time <= item.end_time:
+                    if i != self.current_sentence_index:
+                        self.current_sentence_index = i
+                        # Clear previous selection
+                        for j in range(self.count()):
+                            self.item(j).setSelected(False)
+                        # Select current
+                        item.setSelected(True)
+                        # Auto-scroll if needed
+                        if not self.visualItemRect(item).intersects(self.viewport().rect()):
+                            self.scrollToItem(item, QListWidget.ScrollHint.EnsureVisible)
+                    return
+            elif isinstance(item, InBetweenItem):
+                if item.start_time <= current_time <= item.end_time:
+                    if i != self.current_sentence_index:
+                        self.current_sentence_index = i
+                        # Clear previous selection
+                        for j in range(self.count()):
+                            self.item(j).setSelected(False)
+                        # Select current
+                        item.setSelected(True)
+                        # Auto-scroll if needed
+                        if not self.visualItemRect(item).intersects(self.viewport().rect()):
+                            self.scrollToItem(item, QListWidget.ScrollHint.EnsureVisible)
+                    return
         
-        # No sentence found, clear selection
+        # No item found, clear selection
         if self.current_sentence_index >= 0:
             for j in range(self.count()):
                 self.item(j).setSelected(False)
@@ -494,6 +809,18 @@ class SentenceListWidget(QListWidget):
     def get_modified_sentences(self) -> List[Dict[str, Any]]:
         """Get all sentences with their current modification status."""
         return [item.sentence_data for item in self.sentences]
+    
+    def get_disabled_gaps(self) -> List[Tuple[float, float]]:
+        """Get all disabled gaps (time ranges to remove)."""
+        return [(gap.start_time, gap.end_time) for gap in self.gaps if not gap.is_enabled]
+    
+    def get_enabled_sentences(self) -> List[SentenceItem]:
+        """Get all sentences that are NOT marked for removal."""
+        return [s for s in self.sentences if not s.is_removed]
+    
+    def get_removed_sentences(self) -> List[Tuple[float, float]]:
+        """Get time ranges of sentences marked for removal."""
+        return [(s.start_time, s.end_time) for s in self.sentences if s.is_removed]
 
 
 class PlaybackControlsWidget(QWidget):
@@ -865,21 +1192,31 @@ class VideoReviewWindow(QMainWindow):
     
     def _render_video(self):
         """Render the processed video."""
-        # Collect all REMOVED segments
-        removed_segments = []
-        for mod in self.modifications:
-            if mod.get('modification') == 'REMOVED':
-                start_time = float(mod.get('start_time', 0.0))
-                end_time = float(mod.get('end_time', 0.0))
-                removed_segments.append((start_time, end_time))
+        # Collect segments to remove from various sources
+        segments_to_remove: List[Tuple[float, float]] = []
         
-        # Check if we have sentences for "remove space between sentences" mode
-        has_sentences = any(mod.get('reason') == 'Sentence' for mod in self.modifications)
+        # 1. Collect disabled sentences (marked for removal in UI)
+        removed_sentences = self.sentence_list.get_removed_sentences()
+        segments_to_remove.extend(removed_sentences)
         
-        if not removed_segments and not has_sentences:
+        # 2. Collect disabled gaps (gaps that user hasn't enabled)
+        # NOTE: Gaps are calculated with padding, so they represent the actual gap boundaries
+        # after padding is applied. We should remove these as-is.
+        disabled_gaps = self.sentence_list.get_disabled_gaps()
+        segments_to_remove.extend(disabled_gaps)
+        
+        # 3. Find silences that fall within enabled sentences
+        enabled_sentences = self.sentence_list.get_enabled_sentences()
+        silences_in_sentences = self._find_silences_within_sentences(enabled_sentences)
+        segments_to_remove.extend(silences_in_sentences)
+        
+        # Merge overlapping segments
+        segments_to_remove = self._merge_segments(segments_to_remove)
+        
+        if not segments_to_remove:
             QMessageBox.information(
                 self, "No Segments to Remove",
-                "No segments are marked for removal and no sentences found. Nothing to render."
+                "No segments are marked for removal. Nothing to render."
             )
             return
         
@@ -902,26 +1239,17 @@ class VideoReviewWindow(QMainWindow):
         dialog.setWindowTitle("Render Options")
         layout = QVBoxLayout()
         
-        # Confirmation message
-        if removed_segments:
-            total_duration = sum(end - start for start, end in removed_segments)
-            message_text = f"Remove {len(removed_segments)} segment(s) totaling {total_duration:.1f} seconds?\n\n"
-        else:
-            message_text = "Render video?\n\n"
+        # Confirmation message with breakdown
+        total_duration = sum(end - start for start, end in segments_to_remove)
+        message_text = f"Segments to remove:\n"
+        message_text += f"  - Disabled sentences: {len(removed_sentences)}\n"
+        message_text += f"  - Disabled gaps: {len(disabled_gaps)}\n"
+        message_text += f"  - Silences in enabled sentences: {len(silences_in_sentences)}\n"
+        message_text += f"\nTotal: {len(segments_to_remove)} segment(s), {total_duration:.1f} seconds\n\n"
         message_text += f"Output: {output_path.name}"
         
         message_label = QLabel(message_text)
         layout.addWidget(message_label)
-        
-        # Checkbox for remove space between sentences (only show if sentences exist)
-        remove_space_checkbox = None
-        if has_sentences:
-            remove_space_checkbox = QCheckBox("Remove space between sentences")
-            remove_space_checkbox.setToolTip(
-                "When enabled, only keep segments covered by sentences. "
-                "All gaps between sentences will be removed."
-            )
-            layout.addWidget(remove_space_checkbox)
         
         # Checkbox for re-encode video
         re_encode_checkbox = QCheckBox("Re-encode video for precise cuts")
@@ -944,7 +1272,6 @@ class VideoReviewWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         
-        remove_space_between_sentences = remove_space_checkbox.isChecked() if remove_space_checkbox else False
         re_encode_video = re_encode_checkbox.isChecked()
         
         # Show progress dialog
@@ -953,14 +1280,14 @@ class VideoReviewWindow(QMainWindow):
         self.progress_dialog.setAutoClose(False)
         self.progress_dialog.setAutoReset(False)
         
-        # Create worker thread
+        # Create worker thread (no longer using remove_space_between_sentences flag)
         self.render_worker = RenderWorker(
             self.original_video_path,
             output_path,
-            removed_segments,
-            remove_space_between_sentences,
-            self.modifications,
-            re_encode_video,
+            segments_to_remove,
+            remove_space_between_sentences=False,  # Deprecated, gaps handled in UI
+            modifications=self.modifications,
+            re_encode_video=re_encode_video,
             chunk_size=5.0
         )
         
@@ -973,6 +1300,71 @@ class VideoReviewWindow(QMainWindow):
         # Start render
         self.progress_dialog.show()
         self.render_worker.start()
+    
+    def _find_silences_within_sentences(self, enabled_sentences: List[SentenceItem]) -> List[Tuple[float, float]]:
+        """Find silence segments that fall within enabled sentences.
+        
+        Args:
+            enabled_sentences: List of sentences that are NOT marked for removal
+            
+        Returns:
+            List of (start_time, end_time) tuples for silences within sentences
+        """
+        silences_in_sentences = []
+        
+        # Get all silence (dead air) segments from modifications
+        silence_segments = [
+            (float(mod.get('start_time', 0.0)), float(mod.get('end_time', 0.0)))
+            for mod in self.modifications
+            if mod.get('reason') == 'dead air'
+        ]
+        
+        # For each silence, check if it falls within any enabled sentence
+        for silence_start, silence_end in silence_segments:
+            for sentence in enabled_sentences:
+                # Check if silence is fully contained within sentence
+                if silence_start >= sentence.start_time and silence_end <= sentence.end_time:
+                    silences_in_sentences.append((silence_start, silence_end))
+                    break  # Found a containing sentence, no need to check others
+                # Check if silence partially overlaps with sentence (clip to sentence bounds)
+                elif silence_start < sentence.end_time and silence_end > sentence.start_time:
+                    # Calculate the overlapping portion
+                    overlap_start = max(silence_start, sentence.start_time)
+                    overlap_end = min(silence_end, sentence.end_time)
+                    if overlap_end > overlap_start:
+                        silences_in_sentences.append((overlap_start, overlap_end))
+                        break
+        
+        return silences_in_sentences
+    
+    def _merge_segments(self, segments: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+        """Merge overlapping or adjacent segments.
+        
+        Args:
+            segments: List of (start_time, end_time) tuples
+            
+        Returns:
+            List of merged (start_time, end_time) tuples
+        """
+        if not segments:
+            return []
+        
+        # Sort by start time
+        sorted_segments = sorted(segments, key=lambda x: x[0])
+        merged = [sorted_segments[0]]
+        
+        for current_start, current_end in sorted_segments[1:]:
+            last_start, last_end = merged[-1]
+            
+            # If current segment overlaps or is adjacent to the last merged segment
+            if current_start <= last_end:
+                # Merge by extending the end time
+                merged[-1] = (last_start, max(last_end, current_end))
+            else:
+                # No overlap, add as new segment
+                merged.append((current_start, current_end))
+        
+        return merged
     
     def _on_render_progress(self, percentage: int, message: str):
         """Handle render progress update."""
@@ -1040,6 +1432,9 @@ def main():
     
     window = VideoReviewWindow(video_path, json_path)
     window.show()
+    # Use a short timer to ensure the window is fully mapped to X11
+    # before VLC tries to embed into it (winId() must be valid)
+    QTimer.singleShot(300, window._load_video)
     
     sys.exit(app.exec())
 

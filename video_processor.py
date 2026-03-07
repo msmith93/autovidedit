@@ -698,6 +698,8 @@ class VideoProcessor:
         for remove_start, remove_end in sorted(segments_to_remove, key=lambda x: x[0]):
             # If there's a gap before this removal, add it as a segment to keep
             if remove_start > current_time:
+                if remove_start - current_time < 0.3:
+                    continue
                 segments_to_keep.append((current_time, remove_start))
             
             current_time = max(current_time, remove_end)
@@ -711,6 +713,11 @@ class VideoProcessor:
         
         # Merge overlapping segments to avoid redundant extraction
         segments_to_keep = self._merge_overlapping_segments(segments_to_keep)
+        
+        # Note: We do NOT filter out small segments to keep, as this would create gaps
+        # in the timeline and cause frame misalignment/blurriness when concatenating.
+        # Only filter segments to REMOVE (which happens in the UI before calling this).
+        
         print(f"Merged segments: {segments_to_keep}")
         # import sys
         # sys.exit(0)
