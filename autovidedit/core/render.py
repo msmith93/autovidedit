@@ -2,11 +2,15 @@
 
 import shutil
 import tempfile
+import threading
 from pathlib import Path
 from typing import Callable, List, Optional
 
 from . import ffprobe
+from .ffprobe import RenderCancelled
 from .segments import Segment, invert_segments
+
+__all__ = ["VideoRenderer", "render_edit_plan", "RenderCancelled", "MIN_KEEP_SEGMENT"]
 
 # Keep-segments shorter than this are dropped rather than extracted; sub-frame
 # slivers between two removals aren't worth a cut and often fail to extract.
@@ -35,6 +39,7 @@ class VideoRenderer:
         progress: ProgressFn = None,
         re_encode_video: bool = False,
         min_keep_segment: float = MIN_KEEP_SEGMENT,
+        cancel_event: "threading.Event | None" = None,
     ):
         """Remove the given segments, writing the concatenated remainder.
 
@@ -50,7 +55,7 @@ class VideoRenderer:
         num_audio_tracks = ffprobe.get_audio_track_count(input_path)
 
         if not segments_to_remove:
-            self.copy_video(input_path, output_path)
+            self.copy_video(input_path, output_path, cancel_event=cancel_event)
             return
 
         segments_to_keep = invert_segments(segments_to_remove, duration, min_keep_segment)
@@ -62,16 +67,19 @@ class VideoRenderer:
             segment_files = []
             total = len(segments_to_keep)
             for idx, (start, end) in enumerate(segments_to_keep):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RenderCancelled("Render cancelled")
                 report(int(idx / total * 90), f"Extracting segment {idx + 1} of {total}")
                 print(f"  Segment {idx + 1}/{total}: {start:.2f}s - {end:.2f}s ({end - start:.2f}s)")
                 segment_file = temp_dir / f"segment_{idx:04d}.mkv"
                 self._extract_segment(
-                    input_path, start, end, segment_file, num_audio_tracks, re_encode_video
+                    input_path, start, end, segment_file, num_audio_tracks,
+                    re_encode_video, cancel_event=cancel_event,
                 )
                 segment_files.append(segment_file)
 
             report(90, f"Concatenating {len(segment_files)} segment(s)")
-            self._concatenate(segment_files, output_path, num_audio_tracks)
+            self._concatenate(segment_files, output_path, num_audio_tracks, cancel_event=cancel_event)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -83,6 +91,7 @@ class VideoRenderer:
         output_path: Path,
         num_audio_tracks: int,
         re_encode_video: bool,
+        cancel_event: "threading.Event | None" = None,
     ):
         duration = end - start
         if duration < 0.01:
@@ -100,13 +109,14 @@ class VideoRenderer:
             args += ["-map", f"0:a:{i}"]
         args += ["-c:a", "copy", "-avoid_negative_ts", "make_zero", str(output_path)]
 
-        ffprobe.run_ffmpeg(args)
+        ffprobe.run_ffmpeg(args, cancel_event=cancel_event)
 
         if not output_path.exists() or output_path.stat().st_size == 0:
             raise RuntimeError(f"Extracted segment is missing or empty: {output_path}")
 
     def _concatenate(
-        self, video_files: List[Path], output_path: Path, num_audio_tracks: int
+        self, video_files: List[Path], output_path: Path, num_audio_tracks: int,
+        cancel_event: "threading.Event | None" = None,
     ):
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False
@@ -120,11 +130,14 @@ class VideoRenderer:
             for i in range(num_audio_tracks):
                 args += ["-map", f"0:a:{i}"]
             args += ["-c", "copy", str(output_path)]
-            ffprobe.run_ffmpeg(args)
+            ffprobe.run_ffmpeg(args, cancel_event=cancel_event)
         finally:
             concat_path.unlink(missing_ok=True)
 
-    def convert_to_mov(self, input_path: Path, output_path: Path):
+    def convert_to_mov(
+        self, input_path: Path, output_path: Path,
+        cancel_event: "threading.Event | None" = None,
+    ):
         """Re-encode to MOV with constant frame rate and CBR AAC for Kdenlive.
 
         Fixes VFR and timestamp-drift issues that cause audio crackling when
@@ -137,11 +150,23 @@ class VideoRenderer:
         for i in range(num_audio_tracks):
             args += ["-map", f"0:a:{i}"]
         args += self._encoding_args()
-        args += ["-r", str(frame_rate), "-c:a", "aac", "-b:a", "192k", str(output_path)]
-        ffprobe.run_ffmpeg(args)
+        args += ["-r", str(frame_rate), "-c:a", "aac"]
+        # Set the target bitrate per output stream so every track carries the
+        # same intent (a global -b:a is applied per-stream by ffmpeg anyway, but
+        # being explicit avoids ambiguity across ffmpeg versions/filtergraphs).
+        for i in range(num_audio_tracks):
+            args += [f"-b:a:{i}", "192k"]
+        args += [str(output_path)]
+        ffprobe.run_ffmpeg(args, cancel_event=cancel_event)
 
-    def copy_video(self, input_path: Path, output_path: Path):
-        ffprobe.run_ffmpeg(["-i", str(input_path), "-map", "0", "-c", "copy", str(output_path)])
+    def copy_video(
+        self, input_path: Path, output_path: Path,
+        cancel_event: "threading.Event | None" = None,
+    ):
+        ffprobe.run_ffmpeg(
+            ["-i", str(input_path), "-map", "0", "-c", "copy", str(output_path)],
+            cancel_event=cancel_event,
+        )
 
     def optimize_keyframes(
         self, input_path: Path, output_path: Path, progress: Optional[Callable[[str], None]] = None
@@ -170,6 +195,7 @@ def render_edit_plan(
     segments_to_remove: List[Segment],
     progress: ProgressFn = None,
     re_encode_video: bool = False,
+    cancel_event: "threading.Event | None" = None,
 ):
     """Full render: cut segments, then convert to MOV if the output is .mov."""
     renderer = VideoRenderer()
@@ -178,16 +204,18 @@ def render_edit_plan(
         temp_output = output_path.parent / f"{output_path.stem}_temp.mkv"
         try:
             renderer.remove_segments(
-                render_source, temp_output, segments_to_remove, progress, re_encode_video
+                render_source, temp_output, segments_to_remove, progress,
+                re_encode_video, cancel_event=cancel_event,
             )
             if progress:
                 progress(95, "Converting to constant frame rate and CBR AAC audio")
-            renderer.convert_to_mov(temp_output, output_path)
+            renderer.convert_to_mov(temp_output, output_path, cancel_event=cancel_event)
         finally:
             temp_output.unlink(missing_ok=True)
     else:
         renderer.remove_segments(
-            render_source, output_path, segments_to_remove, progress, re_encode_video
+            render_source, output_path, segments_to_remove, progress,
+            re_encode_video, cancel_event=cancel_event,
         )
 
     if progress:

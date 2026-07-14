@@ -62,10 +62,14 @@ Outputs land in `<video>_preprocessed/` next to the input file:
 
 - Checkbox = keep in video. Sentences default to kept, gaps and silences to removed.
 - Click a row to jump there; shift/ctrl-click to multi-select, then **K**eep / **R**emove.
+- **Skip removed** (toggle, hotkey **S**, on by default) plays the video as it will
+  be cut, jumping over every removed region so you hear the final edit before
+  rendering. Manual seeks still land inside removed regions for inspection.
 - Yellow-flagged rows overlap a removed sentence on the other audio track.
 - The waveform shades everything currently marked for removal; click it to seek.
 - **Render…** offers stream copy (fast; combine with `--optimize-keyframes` for
-  clean cuts) or full re-encode (frame-precise, slower).
+  clean cuts) or full re-encode (frame-precise, slower). A running render can be
+  cancelled from the progress dialog.
 
 ## Development
 

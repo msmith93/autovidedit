@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 
 from ..core import ffprobe
 from ..core.edit_plan import KEPT, REMOVED, EditPlan
-from ..core.render import render_edit_plan
+from ..core.render import RenderCancelled, render_edit_plan
 
 STATIC_DIR = Path(__file__).parent / "static"
 WAVEFORM_POINTS = 2000
@@ -35,9 +35,11 @@ def create_app(
 
     render_state = {
         "running": False, "pct": 0, "msg": "", "done": False,
-        "success": False, "error": None, "output": None,
+        "success": False, "error": None, "output": None, "cancelled": False,
     }
     render_lock = threading.Lock()
+    # Signals the active render's ffmpeg subprocess to abort; replaced per run.
+    current_cancel_event = {"event": None}
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -119,13 +121,15 @@ def create_app(
     @app.post("/api/render")
     async def start_render(request: Request):
         body = await request.json()
+        cancel_event = threading.Event()
         with render_lock:
             if render_state["running"]:
                 raise HTTPException(409, "A render is already running")
             render_state.update(
                 running=True, pct=0, msg="Starting...", done=False,
-                success=False, error=None, output=None,
+                success=False, error=None, output=None, cancelled=False,
             )
+            current_cancel_event["event"] = cancel_event
 
         output_path = Path(body.get("output") or default_output)
         re_encode = bool(body.get("re_encode", False))
@@ -133,6 +137,7 @@ def create_app(
         if not segments:
             with render_lock:
                 render_state.update(running=False, done=True)
+                current_cancel_event["event"] = None
             raise HTTPException(400, "No segments are marked for removal")
 
         def progress(pct, msg):
@@ -144,17 +149,27 @@ def create_app(
                 render_edit_plan(
                     render_source, output_path, segments,
                     progress=progress, re_encode_video=re_encode,
+                    cancel_event=cancel_event,
                 )
                 with render_lock:
                     render_state.update(
                         running=False, done=True, success=True,
                         pct=100, output=str(output_path),
                     )
+            except RenderCancelled:
+                with render_lock:
+                    render_state.update(
+                        running=False, done=True, success=False,
+                        error=None, cancelled=True,
+                    )
             except Exception as e:
                 with render_lock:
                     render_state.update(
                         running=False, done=True, success=False, error=str(e)
                     )
+            finally:
+                with render_lock:
+                    current_cancel_event["event"] = None
 
         threading.Thread(target=run, daemon=True).start()
         removed_total = sum(end - start for start, end in segments)
@@ -172,6 +187,16 @@ def create_app(
                 await asyncio.sleep(0.4)
 
         return StreamingResponse(events(), media_type="text/event-stream")
+
+    @app.post("/api/render/cancel")
+    def cancel_render():
+        with render_lock:
+            event = current_cancel_event["event"]
+            if not render_state["running"] or event is None:
+                raise HTTPException(409, "No render is running")
+            event.set()
+            render_state.update(msg="Cancelling...")
+        return {"cancelling": True}
 
     return app
 

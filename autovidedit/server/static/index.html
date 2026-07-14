@@ -23,11 +23,12 @@
     <div class="controls">
       <button id="play-btn" title="Space">▶</button>
       <span id="time-label">00:00 / 00:00</span>
+      <button id="skip-btn" class="active" title="S — skip removed regions during playback">Skip removed</button>
       <span class="spacer"></span>
       <span class="speed-label">Speed:</span>
       <span id="speed-buttons"></span>
     </div>
-    <div class="hint">Space play/pause · ←/→ seek 5s · click a row to jump · shift/ctrl-click to multi-select · K keep · R remove</div>
+    <div class="hint">Space play/pause · ←/→ seek 5s · S skip removed · click a row to jump · shift/ctrl-click to multi-select · K keep · R remove</div>
   </section>
 
   <section class="list-pane">
@@ -62,6 +63,7 @@
       <div class="progress-track"><div id="progress-fill"></div></div>
       <p id="progress-msg"></p>
       <div class="modal-actions">
+        <button id="render-cancel-run">Cancel render</button>
         <button id="render-close" class="hidden">Close</button>
       </div>
     </div>

@@ -2,6 +2,8 @@
 
 import json
 import subprocess
+import threading
+import time
 from functools import lru_cache
 from pathlib import Path
 
@@ -10,15 +12,55 @@ class FFmpegError(RuntimeError):
     pass
 
 
-def run_ffmpeg(args: list, timeout: float = None) -> subprocess.CompletedProcess:
-    """Run ffmpeg with the given arguments, raising FFmpegError on failure."""
+class RenderCancelled(Exception):
+    """Raised when an ffmpeg run is aborted via its cancel_event."""
+
+
+def run_ffmpeg(
+    args: list,
+    timeout: float = None,
+    cancel_event: "threading.Event | None" = None,
+) -> subprocess.CompletedProcess:
+    """Run ffmpeg with the given arguments, raising FFmpegError on failure.
+
+    If ``cancel_event`` is provided the process is polled while it runs; when
+    the event is set the process is terminated (then killed if it lingers) and
+    ``RenderCancelled`` is raised.
+    """
     cmd = ["ffmpeg", "-hide_banner", "-y"] + [str(a) for a in args]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-    if result.returncode != 0:
-        raise FFmpegError(
-            f"ffmpeg failed: {' '.join(cmd)}\n{result.stderr.strip()[-2000:]}"
-        )
-    return result
+
+    if cancel_event is None:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            raise FFmpegError(
+                f"ffmpeg failed: {' '.join(cmd)}\n{result.stderr.strip()[-2000:]}"
+            )
+        return result
+
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + timeout if timeout else None
+    while True:
+        if cancel_event.is_set():
+            proc.terminate()
+            try:
+                proc.communicate(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+            raise RenderCancelled("Render cancelled")
+        try:
+            stdout, stderr = proc.communicate(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            if deadline and time.monotonic() > deadline:
+                proc.kill()
+                proc.communicate()
+                raise subprocess.TimeoutExpired(cmd, timeout)
+            continue
+        if proc.returncode != 0:
+            raise FFmpegError(
+                f"ffmpeg failed: {' '.join(cmd)}\n{(stderr or '').strip()[-2000:]}"
+            )
+        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 def probe(video_path: Path) -> dict:

@@ -13,6 +13,8 @@ const state = {
   selectedIds: new Set(),
   anchorIndex: -1,
   peaks: null,
+  skipMode: true,           // auto-skip removed regions during playback
+  removalSegments: [],      // cached segmentsToRemove(), refreshed by refreshRows
 };
 
 const $ = (id) => document.getElementById(id);
@@ -202,6 +204,7 @@ function overlapWarnings() {
 }
 
 function refreshRows() {
+  state.removalSegments = segmentsToRemove();
   const warnings = overlapWarnings();
   for (const { entry, el } of state.rows) {
     el.className = "entry";
@@ -249,7 +252,15 @@ function setupPlayback() {
     speedBox.appendChild(btn);
   }
 
+  const skipBtn = $("skip-btn");
+  const setSkip = (on) => {
+    state.skipMode = on;
+    skipBtn.classList.toggle("active", on);
+  };
+  skipBtn.addEventListener("click", () => setSkip(!state.skipMode));
+
   video.addEventListener("timeupdate", () => {
+    if (state.skipMode && !video.paused) skipRemovedRegion();
     $("time-label").textContent = `${fmtTime(video.currentTime)} / ${fmtTime(state.duration)}`;
     highlightPlayingRow();
     drawPlayhead();
@@ -262,7 +273,22 @@ function setupPlayback() {
     else if (ev.code === "ArrowRight") video.currentTime = Math.min(state.duration, video.currentTime + 5);
     else if (ev.key === "k" || ev.key === "K") applyToSelection(KEPT);
     else if (ev.key === "r" || ev.key === "R") applyToSelection(REMOVED);
+    else if (ev.key === "s" || ev.key === "S") setSkip(!state.skipMode);
   });
+}
+
+// Jump the playhead past any removed segment it has entered during playback.
+// Only invoked from timeupdate-while-playing, so manual seeks can still land
+// inside removed regions for inspection.
+function skipRemovedRegion() {
+  const t = video.currentTime;
+  for (const [start, end] of state.removalSegments) {
+    if (start <= t && t < end) {
+      if (end + 0.01 >= state.duration) video.pause();
+      else video.currentTime = end + 0.01;
+      return;
+    }
+  }
 }
 
 let lastPlayingRow = null;
@@ -382,6 +408,7 @@ function setupRender() {
     $("render-form").classList.add("hidden");
     $("render-progress").classList.remove("hidden");
     $("render-close").classList.add("hidden");
+    $("render-cancel-run").classList.remove("hidden");
     $("progress-msg").className = "";
 
     const events = new EventSource("/api/render/progress");
@@ -391,16 +418,29 @@ function setupRender() {
       $("progress-msg").textContent = data.msg || "";
       if (data.done) {
         events.close();
+        $("render-cancel-run").classList.add("hidden");
         $("render-close").classList.remove("hidden");
         if (data.success) {
           $("progress-msg").textContent = "Done! Saved to: " + data.output;
           $("progress-msg").className = "success";
+        } else if (data.cancelled) {
+          $("progress-msg").textContent = "Render cancelled.";
+          $("progress-msg").className = "";
         } else {
           $("progress-msg").textContent = "Render failed: " + data.error;
           $("progress-msg").className = "error";
         }
       }
     };
+  });
+
+  $("render-cancel-run").addEventListener("click", async () => {
+    $("render-cancel-run").disabled = true;
+    const res = await fetch("/api/render/cancel", { method: "POST" });
+    if (!res.ok && res.status !== 409) {
+      alert("Cancel failed: " + (await res.text()));
+    }
+    $("render-cancel-run").disabled = false;
   });
 }
 
