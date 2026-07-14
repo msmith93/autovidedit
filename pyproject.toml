@@ -1,0 +1,27 @@
+[project]
+name = "autovidedit"
+version = "1.0.0"
+description = "Automatically removes dead air/silence from video files with a human review step"
+requires-python = ">=3.10"
+dependencies = [
+    "pydub>=0.25.1",
+    "faster-whisper>=1.0.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+autovidedit = "autovidedit.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["autovidedit*"]
+
+[tool.setuptools.package-data]
+"autovidedit.server" = ["static/*"]
