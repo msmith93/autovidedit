@@ -45,6 +45,7 @@ Outputs land in `<video>_preprocessed/` next to the input file:
 |---|---|
 | `*_modifications.json` | edit plan; review decisions are saved here |
 | `*_preview.mp4` | proxy the review UI plays |
+| `*_preview.waveform.json` | cached waveform peaks for the UI |
 | `*_keyframe_optimized.mov` | optional GOP=5 render source for precise stream-copy cuts |
 | `*_processed.mov` | final render |
 
