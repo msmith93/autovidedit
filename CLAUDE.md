@@ -9,7 +9,7 @@ cuts. NVENC GPU acceleration is used automatically when available.
 ```bash
 autovidedit <video.mkv>              # preprocess (if needed) + open review UI
 autovidedit preprocess <video.mkv>   # analyze only
-autovidedit review <video.mkv>       # review UI only (http://127.0.0.1:8765)
+autovidedit review <video.mkv>       # review UI only (http://127.0.0.1:8791)
 autovidedit render <video.mkv>       # headless render from saved plan
 ```
 

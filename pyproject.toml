@@ -25,3 +25,7 @@ include = ["autovidedit*"]
 
 [tool.setuptools.package-data]
 "autovidedit.server" = ["static/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

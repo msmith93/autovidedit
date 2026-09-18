@@ -212,7 +212,7 @@ def main():
 
     p_rev = subparsers.add_parser("review", help="Open the browser review UI")
     add_common(p_rev)
-    p_rev.add_argument("--port", type=int, default=8765)
+    p_rev.add_argument("--port", type=int, default=8791)
     p_rev.add_argument("--no-browser", action="store_true",
                        help="Don't open the browser automatically")
 
@@ -253,7 +253,7 @@ def main():
             )
             cmd_preprocess(pre_args)
         rev_args = argparse.Namespace(
-            input_file=args.input_file, port=8765, no_browser=False
+            input_file=args.input_file, port=8791, no_browser=False
         )
         cmd_review(rev_args)
 
