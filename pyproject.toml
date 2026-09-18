@@ -1,7 +1,7 @@
 [project]
 name = "autovidedit"
-version = "1.0.0"
-description = "Automatically removes dead air/silence from video files with a human review step"
+version = "2.0.0"
+description = "Cuts dead air, retakes and filler from recordings, with AI suggestions and a human review step"
 requires-python = ">=3.10"
 dependencies = [
     "pydub>=0.25.1",
@@ -11,7 +11,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "httpx>=0.27"]
+dev = ["pytest>=8.0", "httpx>=0.27", "numpy"]
+# Claude-powered `autovidedit suggest`
+ai = ["anthropic>=1.6"]
 # CUDA runtime libs for GPU transcription (loaded by core/cuda_libs.py)
 gpu = ["nvidia-cublas-cu12", "nvidia-cudnn-cu12>=9,<10"]
 

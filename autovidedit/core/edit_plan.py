@@ -181,6 +181,14 @@ class EditPlan(BaseModel):
         try:
             with os.fdopen(fd, "w") as f:
                 f.write(payload)
+            # mkstemp creates 0600; keep the existing file's mode, else the umask default.
+            if path.exists():
+                mode = path.stat().st_mode & 0o777
+            else:
+                umask = os.umask(0)
+                os.umask(umask)
+                mode = 0o666 & ~umask
+            os.chmod(tmp, mode)
             os.replace(tmp, path)
         except BaseException:
             Path(tmp).unlink(missing_ok=True)

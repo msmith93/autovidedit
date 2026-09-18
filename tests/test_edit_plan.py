@@ -46,6 +46,8 @@ def test_save_is_atomic_and_leaves_no_temp_files(tmp_path):
     plan.add_silence(1.0, 2.0)
     plan.save(tmp_path / "plan.json")
     assert [p.name for p in tmp_path.iterdir()] == ["plan.json"]
+    # Not left owner-only by the temp file.
+    assert (tmp_path / "plan.json").stat().st_mode & 0o044
 
 
 def test_migrates_v1_plan(tmp_path):
