@@ -16,6 +16,9 @@ class Transcriber:
     def _load_model(self):
         if self._model is not None:
             return
+        from .cuda_libs import preload_cuda_libs
+
+        preload_cuda_libs()
         try:
             from faster_whisper import WhisperModel
         except ImportError:
