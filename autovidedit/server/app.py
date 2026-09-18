@@ -1,4 +1,10 @@
-"""FastAPI server for the browser review UI."""
+"""FastAPI server for the browser review UI.
+
+The server owns all removal math: the UI sends decisions and gets back the
+recomputed removal spans. The plan file on disk is the source of truth; if
+another process (e.g. `autovidedit plan apply` run by an agent) changes it,
+the server reloads it on the next request.
+"""
 
 import asyncio
 import json
@@ -12,8 +18,8 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..core import ffprobe
-from ..core.edit_plan import KEPT, REMOVED, EditPlan
-from ..core.render import RenderCancelled, render_edit_plan
+from ..core.edit_plan import KEEP, REMOVE, EditPlan, removal_stats
+from ..core.render import RenderCancelled, render_video
 
 STATIC_DIR = Path(__file__).parent / "static"
 WAVEFORM_POINTS = 2000
@@ -21,24 +27,43 @@ STREAM_CHUNK = 512 * 1024
 
 
 def create_app(
-    video_name: str,
+    video_path: Path,
     preview_path: Path,
-    render_source: Path,
     plan_path: Path,
     default_output: Path,
 ) -> FastAPI:
     app = FastAPI(title="autovidedit review")
 
-    plan = EditPlan.load(plan_path)
-    duration = ffprobe.get_duration(preview_path)
-    plan.ensure_gaps(duration)
+    video_duration = ffprobe.get_duration(video_path)
+    plan_lock = threading.Lock()
+    store = {"plan": None, "mtime": None}
+
+    def current_plan() -> EditPlan:
+        """Return the plan, reloading it if the file changed on disk."""
+        mtime = plan_path.stat().st_mtime_ns
+        if store["plan"] is None or store["mtime"] != mtime:
+            plan = EditPlan.load(plan_path)
+            if not plan.duration:
+                plan.duration = round(video_duration, 3)
+            if not plan.video:
+                plan.video = video_path.name
+            plan.ensure_gaps(plan.duration)
+            store["plan"], store["mtime"] = plan, mtime
+        return store["plan"]
+
+    def save(plan: EditPlan):
+        plan.save(plan_path)
+        store["mtime"] = plan_path.stat().st_mtime_ns
+
+    def removal_payload(plan: EditPlan) -> dict:
+        spans = plan.segments_to_remove(video_duration)
+        return {"removals": spans, "stats": removal_stats(spans)}
 
     render_state = {
         "running": False, "pct": 0, "msg": "", "done": False,
         "success": False, "error": None, "output": None, "cancelled": False,
     }
     render_lock = threading.Lock()
-    # Signals the active render's ffmpeg subprocess to abort; replaced per run.
     current_cancel_event = {"event": None}
 
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -49,28 +74,42 @@ def create_app(
 
     @app.get("/api/state")
     def state():
-        return {
-            "video_name": video_name,
-            "render_source": render_source.name,
-            "duration": duration,
-            "default_output": str(default_output),
-            "entries": plan.entries,
-        }
+        with plan_lock:
+            plan = current_plan()
+            return {
+                "video_name": video_path.name,
+                "duration": video_duration,
+                "default_output": str(default_output),
+                "options": plan.options.model_dump(),
+                "entries": [
+                    e.model_dump(exclude={"words"}, exclude_none=True)
+                    for e in plan.entries if e.kind != "silence" or not plan.sentences
+                ],
+                **removal_payload(plan),
+            }
 
     @app.put("/api/plan")
     async def save_plan(request: Request):
+        """Body: {"decisions": {id: "keep"|"remove"}, "max_pause": float?}"""
         body = await request.json()
-        modifications = body.get("modifications", {})
-        unknown = []
-        for entry_id, modification in modifications.items():
-            if modification not in (REMOVED, KEPT):
-                raise HTTPException(400, f"Invalid modification: {modification}")
-            if not plan.set_modification(entry_id, modification):
-                unknown.append(entry_id)
-        if unknown:
-            raise HTTPException(400, f"Unknown entry ids: {unknown}")
-        plan.save(plan_path)
-        return {"saved": len(modifications)}
+        decisions = body.get("decisions", {})
+        with plan_lock:
+            plan = current_plan()
+            bad = [v for v in decisions.values() if v not in (KEEP, REMOVE)]
+            if bad:
+                raise HTTPException(400, f"Invalid decision(s): {bad}")
+            unknown = [i for i in decisions if plan.get(i) is None]
+            if unknown:
+                raise HTTPException(400, f"Unknown entry ids: {unknown}")
+            for entry_id, decision in decisions.items():
+                plan.set_decision(entry_id, decision, source="human")
+            if "max_pause" in body:
+                value = float(body["max_pause"])
+                if not 0 <= value <= 10:
+                    raise HTTPException(400, "max_pause must be between 0 and 10 seconds")
+                plan.options.max_pause = value
+            save(plan)
+            return {"saved": len(decisions), **removal_payload(plan)}
 
     @app.get("/video")
     def video(request: Request):
@@ -110,7 +149,8 @@ def create_app(
     @app.get("/api/waveform")
     def waveform():
         cache = preview_path.with_suffix(".waveform.json")
-        if cache.exists():
+        # Recompute if the preview was regenerated after the cache was written.
+        if cache.exists() and cache.stat().st_mtime >= preview_path.stat().st_mtime:
             return JSONResponse(json.loads(cache.read_text()))
 
         peaks = _compute_peaks(preview_path, WAVEFORM_POINTS)
@@ -132,13 +172,18 @@ def create_app(
             current_cancel_event["event"] = cancel_event
 
         output_path = Path(body.get("output") or default_output)
-        re_encode = bool(body.get("re_encode", False))
-        segments = plan.segments_to_remove(duration)
+        with plan_lock:
+            segments = current_plan().segments_to_remove(video_duration)
+        problem = None
         if not segments:
+            problem = (400, "No segments are marked for removal")
+        elif output_path.resolve() == video_path.resolve():
+            problem = (400, "Output file cannot be the same as the input file")
+        if problem:
             with render_lock:
                 render_state.update(running=False, done=True)
                 current_cancel_event["event"] = None
-            raise HTTPException(400, "No segments are marked for removal")
+            raise HTTPException(*problem)
 
         def progress(pct, msg):
             with render_lock:
@@ -146,10 +191,9 @@ def create_app(
 
         def run():
             try:
-                render_edit_plan(
-                    render_source, output_path, segments,
-                    progress=progress, re_encode_video=re_encode,
-                    cancel_event=cancel_event,
+                render_video(
+                    video_path, output_path, segments,
+                    progress=progress, cancel_event=cancel_event,
                 )
                 with render_lock:
                     render_state.update(
@@ -172,8 +216,7 @@ def create_app(
                     current_cancel_event["event"] = None
 
         threading.Thread(target=run, daemon=True).start()
-        removed_total = sum(end - start for start, end in segments)
-        return {"segments": len(segments), "removed_seconds": round(removed_total, 1)}
+        return removal_stats(segments)
 
     @app.get("/api/render/progress")
     async def render_progress():

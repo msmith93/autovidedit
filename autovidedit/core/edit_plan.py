@@ -1,149 +1,419 @@
-"""Edit-plan model: the JSON file describing proposed and reviewed edits.
+"""Edit plan: the typed JSON document every stage reads and writes.
 
-The plan is a list of entries. Each entry has:
-  id            stable identifier (assigned on creation or load)
-  start_time    seconds
-  end_time      seconds
-  modification  "REMOVED" or "NONE"
-  reason        "dead air" | "Sentence" | "gap"
-  duration      seconds (derived)
-  content       (sentences only) {"audio_track": int, "words": str}
+File format (version 2)::
 
-Semantics:
-  - "dead air":  silence detected by the analyzer. REMOVED by default.
-  - "Sentence":  transcribed speech. NONE (kept) by default; the reviewer
-                 marks unwanted sentences REMOVED.
-  - "gap":       span between sentences where no track has speech. REMOVED
-                 by default; the reviewer can set NONE to keep it.
+    {
+      "version": 2,
+      "video": "recording.mkv",
+      "duration": 3600.0,
+      "options": {"max_pause": 0.5},
+      "entries": [Entry, ...]
+    }
+
+Entry kinds:
+  sentence  transcribed speech on one audio track. Kept by default.
+  silence   span where every audio track is quiet. Removed by default.
+  gap       span between sentences where no track has speech. Removed by default.
+  cut       free-form removal span (AI extra cuts, filler words). Removed by default.
+
+Every entry records who made its current decision (`source`) and optionally
+why (`rationale`, `confidence`). Human decisions are protected from being
+overwritten by automated passes; see `EditPlan.apply_decisions`.
+
+Removal semantics live in `EditPlan.segments_to_remove`; the review UI gets
+the result from the server rather than re-implementing it.
+
+Version 1 plans (a bare JSON list with modification/reason/content fields)
+are migrated on load.
 """
 
+from __future__ import annotations
+
 import json
+import os
+import re
+import tempfile
 import uuid
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Iterable, List, Literal, Optional
 
-from .segments import Segment, gaps_between, intersect_segments, merge_segments
+from pydantic import BaseModel, ConfigDict, Field
 
-REASON_SILENCE = "dead air"
-REASON_SENTENCE = "Sentence"
-REASON_GAP = "gap"
+from .segments import (
+    Segment,
+    gaps_between,
+    intersect_segments,
+    merge_segments,
+    subtract_segments,
+    total_length,
+)
 
-REMOVED = "REMOVED"
-KEPT = "NONE"
+PLAN_VERSION = 2
 
-# Padding applied around sentences when deriving gaps, so tiny inter-word
-# spans don't become gap entries (matches the old UI's behavior).
+Kind = Literal["sentence", "silence", "gap", "cut"]
+Decision = Literal["keep", "remove"]
+Source = Literal["analyzer", "ai", "human"]
+
+KEEP: Decision = "keep"
+REMOVE: Decision = "remove"
+
+DEFAULT_DECISION = {"sentence": KEEP, "silence": REMOVE, "gap": REMOVE, "cut": REMOVE}
+
+# Sentences are grown by this much before deriving gaps, and gaps shorter than
+# MIN_GAP are not listed: pauses that short are never cut (see max_pause).
 GAP_PADDING = 0.2
+MIN_GAP = 0.5
+
+# A pause-trimming cut shorter than this isn't worth making.
+MIN_PAUSE_CUT = 0.2
+
+# Hallucination guard: sentences mostly covered by detected silence, or
+# short stock phrases Whisper invents on quiet audio.
+HALLUCINATION_SILENCE_COVERAGE = 0.8
+HALLUCINATION_PHRASES = {"you", "thank you", "thanks for watching", "thank you for watching"}
+HALLUCINATION_MAX_DURATION = 1.5
+
+_EPS = 1e-6
 
 
 def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-class EditPlan:
-    def __init__(self, entries: Optional[List[dict]] = None):
-        self.entries: List[dict] = entries or []
-        for entry in self.entries:
-            entry.setdefault("id", _new_id())
+def _r(value: float) -> float:
+    return round(float(value), 3)
+
+
+class Word(BaseModel):
+    start: float
+    end: float
+    word: str
+
+
+class Entry(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(default_factory=_new_id)
+    start: float
+    end: float
+    kind: Kind
+    decision: Decision
+    source: Source = "analyzer"
+    rationale: Optional[str] = None
+    confidence: Optional[float] = None
+    track: Optional[int] = None
+    text: Optional[str] = None
+    words: Optional[List[Word]] = None
+
+    @property
+    def span(self) -> Segment:
+        return (self.start, self.end)
+
+    @property
+    def removed(self) -> bool:
+        return self.decision == REMOVE
+
+
+class PlanOptions(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    # Pauses longer than this are shortened to exactly this; shorter ones are
+    # left alone. Half is kept on each side of the cut.
+    max_pause: float = 0.5
+
+
+class DecisionItem(BaseModel):
+    """One decision on an existing entry, from an AI pass or `plan apply`."""
+
+    id: str
+    decision: Decision
+    rationale: Optional[str] = None
+    confidence: Optional[float] = None
+
+
+class CutItem(BaseModel):
+    """A new free-form removal span."""
+
+    start: float
+    end: float
+    rationale: Optional[str] = None
+    confidence: Optional[float] = None
+
+
+class DecisionSet(BaseModel):
+    """Exchange format for automated editing passes (see docs/AGENT_WORKFLOW.md)."""
+
+    decisions: List[DecisionItem] = []
+    extra_cuts: List[CutItem] = []
+
+
+class ApplyResult(BaseModel):
+    applied: int = 0
+    unchanged: int = 0
+    skipped_human: List[str] = []
+    cuts_added: int = 0
+
+
+class EditPlan(BaseModel):
+    version: int = PLAN_VERSION
+    video: str = ""
+    duration: float = 0.0
+    options: PlanOptions = Field(default_factory=PlanOptions)
+    entries: List[Entry] = []
+
+    # ---------- persistence ----------
 
     @classmethod
     def load(cls, path: Path) -> "EditPlan":
-        with open(path) as f:
-            entries = json.load(f)
-        if not isinstance(entries, list):
-            raise ValueError(f"Edit plan {path} must contain a JSON list")
-        return cls(entries)
+        data = json.loads(Path(path).read_text())
+        if isinstance(data, list):
+            return cls(entries=[_migrate_v1_entry(e) for e in data])
+        if not isinstance(data, dict):
+            raise ValueError(f"Edit plan {path} must be a JSON object or list")
+        return cls.model_validate(data)
 
     def save(self, path: Path):
-        self.entries.sort(key=lambda e: float(e.get("start_time", 0.0)))
-        with open(path, "w") as f:
-            json.dump(self.entries, f, indent=2)
+        """Write atomically (temp file + rename) so a crash can't corrupt the plan."""
+        path = Path(path)
+        self.entries.sort(key=lambda e: (e.start, e.end))
+        payload = self.model_dump_json(indent=2, exclude_none=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(payload)
+            os.replace(tmp, path)
+        except BaseException:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
-    def _add(self, start: float, end: float, reason: str, modification: str, **extra) -> dict:
-        entry = {
-            "id": _new_id(),
-            "start_time": round(start, 3),
-            "end_time": round(end, 3),
-            "modification": modification,
-            "reason": reason,
-            **extra,
-            "duration": round(end - start, 3),
-        }
+    # ---------- construction ----------
+
+    def _add(self, kind: Kind, start: float, end: float, **fields) -> Entry:
+        fields.setdefault("decision", DEFAULT_DECISION[kind])
+        entry = Entry(kind=kind, start=_r(start), end=_r(end), **fields)
         self.entries.append(entry)
         return entry
 
-    def add_silence(self, start: float, end: float) -> dict:
-        return self._add(start, end, REASON_SILENCE, REMOVED)
+    def add_sentence(
+        self, start: float, end: float, text: str, track: int,
+        words: Optional[List[dict]] = None,
+    ) -> Entry:
+        word_models = None
+        if words is not None:
+            word_models = [
+                Word(start=_r(w["start"]), end=_r(w["end"]), word=w["word"].strip())
+                for w in words
+            ]
+        return self._add("sentence", start, end, text=text, track=track, words=word_models)
 
-    def add_sentence(self, start: float, end: float, words: str, audio_track: int) -> dict:
+    def add_silence(self, start: float, end: float) -> Entry:
+        return self._add("silence", start, end)
+
+    def add_gap(self, start: float, end: float) -> Entry:
+        return self._add("gap", start, end)
+
+    def add_cut(
+        self, start: float, end: float, source: Source = "ai",
+        rationale: Optional[str] = None, confidence: Optional[float] = None,
+    ) -> Entry:
         return self._add(
-            start, end, REASON_SENTENCE, KEPT,
-            content={"audio_track": audio_track, "words": words},
+            "cut", start, end, source=source, rationale=rationale, confidence=confidence
         )
 
-    def add_gap(self, start: float, end: float) -> dict:
-        return self._add(start, end, REASON_GAP, REMOVED)
+    # ---------- queries ----------
 
-    def _by_reason(self, reason: str) -> List[dict]:
-        return [e for e in self.entries if e.get("reason") == reason]
-
-    @property
-    def sentences(self) -> List[dict]:
-        return self._by_reason(REASON_SENTENCE)
+    def _of_kind(self, kind: Kind) -> List[Entry]:
+        return [e for e in self.entries if e.kind == kind]
 
     @property
-    def silences(self) -> List[dict]:
-        return self._by_reason(REASON_SILENCE)
+    def sentences(self) -> List[Entry]:
+        return self._of_kind("sentence")
 
     @property
-    def gaps(self) -> List[dict]:
-        return self._by_reason(REASON_GAP)
+    def silences(self) -> List[Entry]:
+        return self._of_kind("silence")
 
-    def get(self, entry_id: str) -> Optional[dict]:
-        return next((e for e in self.entries if e.get("id") == entry_id), None)
+    @property
+    def gaps(self) -> List[Entry]:
+        return self._of_kind("gap")
 
-    def set_modification(self, entry_id: str, modification: str) -> bool:
+    @property
+    def cuts(self) -> List[Entry]:
+        return self._of_kind("cut")
+
+    def get(self, entry_id: str) -> Optional[Entry]:
+        return next((e for e in self.entries if e.id == entry_id), None)
+
+    # ---------- editing ----------
+
+    def set_decision(
+        self, entry_id: str, decision: Decision, source: Source = "human",
+        rationale: Optional[str] = None,
+    ) -> bool:
         entry = self.get(entry_id)
         if entry is None:
             return False
-        entry["modification"] = modification
+        entry.decision = decision
+        entry.source = source
+        if rationale is not None:
+            entry.rationale = rationale
         return True
 
-    def ensure_gaps(self, video_duration: float):
+    def apply_decisions(
+        self, decision_set: DecisionSet, source: Source = "ai", force: bool = False
+    ) -> ApplyResult:
+        """Merge an automated pass into the plan.
+
+        Entries whose current decision came from a human are left alone
+        unless `force` is set. Unknown ids raise ValueError before anything
+        is changed. Extra cuts identical to an existing cut are skipped.
+        """
+        unknown = [d.id for d in decision_set.decisions if self.get(d.id) is None]
+        if unknown:
+            raise ValueError(f"Unknown entry ids: {unknown}")
+
+        result = ApplyResult()
+        for item in decision_set.decisions:
+            entry = self.get(item.id)
+            if entry.source == "human" and not force:
+                result.skipped_human.append(entry.id)
+                continue
+            if entry.decision == item.decision and entry.source == source:
+                result.unchanged += 1
+            else:
+                result.applied += 1
+            entry.decision = item.decision
+            entry.source = source
+            entry.rationale = item.rationale
+            entry.confidence = item.confidence
+
+        existing = {(e.start, e.end) for e in self.cuts}
+        for cut in decision_set.extra_cuts:
+            key = (_r(cut.start), _r(cut.end))
+            if cut.end <= cut.start or key in existing:
+                continue
+            self.add_cut(cut.start, cut.end, source=source,
+                         rationale=cut.rationale, confidence=cut.confidence)
+            existing.add(key)
+            result.cuts_added += 1
+        return result
+
+    def ensure_gaps(self, video_duration: Optional[float] = None):
         """Derive gap entries from sentence spans if the plan has none yet.
 
-        Gaps are the spans where no track has a sentence (each sentence grown
-        by GAP_PADDING first). Existing gap entries are preserved so reviewer
-        choices survive a reopen.
+        Gaps are spans where no track has a sentence (each sentence grown by
+        GAP_PADDING first), at least MIN_GAP long. Existing gap entries are
+        preserved so reviewer choices survive a reopen.
         """
+        duration = video_duration or self.duration or None
         if self.gaps or not self.sentences:
             return
-        sentence_ranges = [
-            (float(s["start_time"]), float(s["end_time"])) for s in self.sentences
-        ]
-        for start, end in gaps_between(sentence_ranges, video_duration, GAP_PADDING):
-            self.add_gap(start, end)
+        spans = [s.span for s in self.sentences]
+        for start, end in gaps_between(spans, duration, GAP_PADDING):
+            if end - start >= MIN_GAP:
+                self.add_gap(start, end)
 
-    def segments_to_remove(self, video_duration: float) -> List[Segment]:
-        """Compute the final removal list for rendering.
+    def flag_hallucinations(self) -> List[Entry]:
+        """Mark analyzer-owned sentences that are probably Whisper hallucinations.
 
-        With sentences present: removed sentences + removed gaps + the parts
-        of detected silences that fall inside kept sentences.
-        Without sentences (silence-only plan): all REMOVED dead-air entries.
+        A sentence is flagged if detected silence covers most of it, or if it
+        is a short stock phrase Whisper tends to invent on quiet audio. Flagged
+        sentences are set to remove with a rationale; they stay in the plan so
+        a reviewer can restore them.
         """
-        def ranges(entries):
-            return [(float(e["start_time"]), float(e["end_time"])) for e in entries]
+        silences = [s.span for s in self.silences]
+        flagged = []
+        for sentence in self.sentences:
+            if sentence.source != "analyzer":
+                continue
+            length = sentence.end - sentence.start
+            if length <= 0:
+                continue
+            covered = total_length(intersect_segments(silences, [sentence.span]))
+            normalized = re.sub(r"[^a-z ]", "", (sentence.text or "").lower()).strip()
+            if covered / length >= HALLUCINATION_SILENCE_COVERAGE:
+                reason = "no audio energy under this sentence; likely transcription hallucination"
+            elif normalized in HALLUCINATION_PHRASES and length < HALLUCINATION_MAX_DURATION:
+                reason = "stock phrase Whisper often invents on quiet audio"
+            else:
+                continue
+            sentence.decision = REMOVE
+            sentence.rationale = reason
+            flagged.append(sentence)
+        return flagged
 
-        if not self.sentences:
-            return merge_segments(
-                [r for r in ranges([e for e in self.silences if e["modification"] == REMOVED])]
-            )
+    # ---------- removal computation ----------
 
-        removed = ranges([s for s in self.sentences if s["modification"] == REMOVED])
-        removed += ranges([g for g in self.gaps if g["modification"] == REMOVED])
+    def segments_to_remove(self, video_duration: Optional[float] = None) -> List[Segment]:
+        """Compute the final, merged list of spans to cut.
 
-        kept_sentences = ranges([s for s in self.sentences if s["modification"] != REMOVED])
-        silences = ranges(self.silences)
-        removed += intersect_segments(silences, kept_sentences)
+        Two kinds of removal:
+          content  removed sentences and removed cut entries. Cut in full, except
+                   that kept speech on another track always wins: the overlap is
+                   subtracted so a removed sentence never clips kept speech.
+          pauses   removed silences and removed gaps (minus kept gaps and content).
+                   Each pause is shortened to `options.max_pause` rather than
+                   deleted, keeping half on each side, so speech keeps its natural
+                   rhythm. A pause edge that touches removed content or the start
+                   or end of the video is cut flush instead.
+        """
+        duration = video_duration or self.duration
+        if not duration:
+            raise ValueError("video duration is unknown; pass video_duration")
+        half = max(0.0, self.options.max_pause) / 2
 
-        return merge_segments([(s, min(e, video_duration)) for s, e in removed if s < video_duration])
+        kept_speech = merge_segments([s.span for s in self.sentences if not s.removed])
+        removed_speech = [s.span for s in self.sentences if s.removed]
+        content = merge_segments(
+            subtract_segments(removed_speech, kept_speech)
+            + [c.span for c in self.cuts if c.removed]
+        )
+
+        pause_sources = [s.span for s in self.silences if s.removed]
+        pause_sources += [g.span for g in self.gaps if g.removed]
+        kept_gaps = [g.span for g in self.gaps if not g.removed]
+        pauses = subtract_segments(subtract_segments(pause_sources, kept_gaps), content)
+
+        def touches_content(t: float) -> bool:
+            return any(s - _EPS <= t <= e + _EPS for s, e in content)
+
+        trimmed = []
+        for start, end in merge_segments(pauses):
+            new_start = start if (start <= _EPS or touches_content(start)) else start + half
+            new_end = end if (end >= duration - _EPS or touches_content(end)) else end - half
+            if new_end - new_start >= MIN_PAUSE_CUT:
+                trimmed.append((new_start, new_end))
+
+        result = merge_segments(content + trimmed)
+        return [(max(0.0, s), min(e, duration)) for s, e in result if s < duration]
+
+
+def _migrate_v1_entry(raw: dict) -> Entry:
+    """Convert a version-1 entry (modification/reason/content) to an Entry.
+
+    A v1 decision that differs from the kind's default can only have come
+    from a reviewer, so it is marked source="human" and protected.
+    """
+    kind = {"dead air": "silence", "Sentence": "sentence", "gap": "gap"}.get(
+        raw.get("reason"), "silence"
+    )
+    decision = REMOVE if raw.get("modification") == "REMOVED" else KEEP
+    content = raw.get("content") or {}
+    fields = dict(
+        start=_r(raw.get("start_time", 0.0)),
+        end=_r(raw.get("end_time", 0.0)),
+        kind=kind,
+        decision=decision,
+        source="human" if decision != DEFAULT_DECISION[kind] else "analyzer",
+    )
+    if raw.get("id"):
+        fields["id"] = raw["id"]
+    if kind == "sentence":
+        fields["track"] = content.get("audio_track")
+        fields["text"] = content.get("words")
+    return Entry(**fields)
+
+
+def removal_stats(segments: Iterable[Segment]) -> dict:
+    segments = list(segments)
+    return {"count": len(segments), "seconds": round(total_length(segments), 3)}

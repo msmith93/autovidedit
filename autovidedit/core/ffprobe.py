@@ -2,10 +2,12 @@
 
 import json
 import subprocess
+import tempfile
 import threading
 import time
 from functools import lru_cache
 from pathlib import Path
+from typing import Callable
 
 
 class FFmpegError(RuntimeError):
@@ -20,16 +22,21 @@ def run_ffmpeg(
     args: list,
     timeout: float = None,
     cancel_event: "threading.Event | None" = None,
+    on_progress: "Callable[[float], None] | None" = None,
 ) -> subprocess.CompletedProcess:
     """Run ffmpeg with the given arguments, raising FFmpegError on failure.
 
-    If ``cancel_event`` is provided the process is polled while it runs; when
-    the event is set the process is terminated (then killed if it lingers) and
-    ``RenderCancelled`` is raised.
+    cancel_event: polled while ffmpeg runs; when set the process is terminated
+        (then killed if it lingers) and RenderCancelled is raised.
+    on_progress: called with seconds of output written so far, parsed from
+        ffmpeg's `-progress` stream.
     """
-    cmd = ["ffmpeg", "-hide_banner", "-y"] + [str(a) for a in args]
+    cmd = ["ffmpeg", "-hide_banner", "-y"]
+    if on_progress is not None:
+        cmd += ["-progress", "pipe:1", "-nostats"]
+    cmd += [str(a) for a in args]
 
-    if cancel_event is None:
+    if cancel_event is None and on_progress is None:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if result.returncode != 0:
             raise FFmpegError(
@@ -37,30 +44,56 @@ def run_ffmpeg(
             )
         return result
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    deadline = time.monotonic() + timeout if timeout else None
-    while True:
-        if cancel_event.is_set():
-            proc.terminate()
-            try:
-                proc.communicate(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.communicate()
-            raise RenderCancelled("Render cancelled")
+    # stderr goes to a temp file so a chatty ffmpeg can't fill a pipe and block.
+    with tempfile.TemporaryFile("w+") as stderr_file:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=stderr_file, text=True,
+            stdin=subprocess.DEVNULL,
+        )
+        reader = threading.Thread(
+            target=_read_progress, args=(proc.stdout, on_progress), daemon=True
+        )
+        reader.start()
+        deadline = time.monotonic() + timeout if timeout else None
         try:
-            stdout, stderr = proc.communicate(timeout=0.2)
-        except subprocess.TimeoutExpired:
-            if deadline and time.monotonic() > deadline:
-                proc.kill()
-                proc.communicate()
-                raise subprocess.TimeoutExpired(cmd, timeout)
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    _stop(proc)
+                    raise RenderCancelled("Render cancelled")
+                try:
+                    proc.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if deadline and time.monotonic() > deadline:
+                        _stop(proc)
+                        raise subprocess.TimeoutExpired(cmd, timeout)
+        finally:
+            reader.join(timeout=2)
+        stderr_file.seek(0)
+        stderr = stderr_file.read()
+
+    if proc.returncode != 0:
+        raise FFmpegError(f"ffmpeg failed: {' '.join(cmd)}\n{stderr.strip()[-2000:]}")
+    return subprocess.CompletedProcess(cmd, proc.returncode, "", stderr)
+
+
+def _stop(proc: subprocess.Popen):
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+
+
+def _read_progress(stream, on_progress):
+    """Consume ffmpeg `-progress` key=value lines, reporting out_time."""
+    for line in stream:
+        if on_progress is None:
             continue
-        if proc.returncode != 0:
-            raise FFmpegError(
-                f"ffmpeg failed: {' '.join(cmd)}\n{(stderr or '').strip()[-2000:]}"
-            )
-        return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        key, _, value = line.strip().partition("=")
+        if key == "out_time_us" and value.isdigit():
+            on_progress(int(value) / 1_000_000)
 
 
 def probe(video_path: Path) -> dict:
@@ -127,20 +160,20 @@ def get_duration(video_path: Path) -> float:
     )
 
 
-def get_frame_rate(video_path: Path, default: int = 30) -> int:
-    """Return the rounded video frame rate, or `default` if undetectable."""
+def get_frame_rate_fraction(video_path: Path, default: str = "30/1") -> str:
+    """Return the exact video frame rate as an ffmpeg rational, e.g. '30000/1001'."""
     info = probe(video_path)
     video_stream = next(
         (s for s in info.get("streams", []) if s.get("codec_type") == "video"), None
     )
     if not video_stream:
         return default
-    rate = video_stream.get("r_frame_rate") or video_stream.get("avg_frame_rate")
-    try:
-        num, den = map(int, rate.split("/"))
-        return round(num / den) if den > 0 else default
-    except (AttributeError, ValueError, ZeroDivisionError):
-        return default
+    for key in ("r_frame_rate", "avg_frame_rate"):
+        rate = video_stream.get(key) or ""
+        num, _, den = rate.partition("/")
+        if num.isdigit() and den.isdigit() and int(num) > 0 and int(den) > 0:
+            return f"{int(num)}/{int(den)}"
+    return default
 
 
 @lru_cache(maxsize=1)

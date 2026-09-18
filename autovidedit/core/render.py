@@ -1,222 +1,246 @@
-"""Rendering: cut removal segments out of a video, preserving all audio tracks."""
+"""Single-pass render: cut removal spans out of a video.
 
-import shutil
+Design (chosen so cost doesn't grow with the number of cuts):
+
+  audio  Each track is decoded to raw PCM once and cut sample-exactly in
+         Python as it streams (`cut_audio_track`).
+  video  One `select` keeps frames inside kept spans, and one `setpts` moves
+         each frame earlier by the total removed time before it. That is the
+         same timeline the audio cut produces, so sync error is bounded by one
+         frame at each cut and never accumulates. It also preserves timing for
+         variable-frame-rate sources; the encoder then emits constant frame rate.
+
+The filtergraph has a fixed number of filters no matter how many cuts there
+are (a trim/concat graph with hundreds of branches ran at ~1x real time).
+
+Output is editor-friendly MP4: H.264 at the source's frame rate, constant
+frame rate, 1-second GOP (fast scrubbing in Kdenlive), every audio track
+preserved as AAC 192k.
+"""
+
+import subprocess
 import tempfile
 import threading
+from fractions import Fraction
 from pathlib import Path
 from typing import Callable, List, Optional
 
 from . import ffprobe
 from .ffprobe import RenderCancelled
-from .segments import Segment, invert_segments
+from .segments import Segment, invert_segments, merge_segments, total_length
 
-__all__ = ["VideoRenderer", "render_edit_plan", "RenderCancelled", "MIN_KEEP_SEGMENT"]
+__all__ = [
+    "render_video", "cut_audio_track", "video_filter", "snap_to_frames", "RenderCancelled",
+    "MIN_KEEP_SEGMENT",
+]
 
-# Keep-segments shorter than this are dropped rather than extracted; sub-frame
-# slivers between two removals aren't worth a cut and often fail to extract.
-MIN_KEEP_SEGMENT = 0.3
+# Kept spans shorter than this are dropped: slivers between two removals
+# aren't worth a cut.
+MIN_KEEP_SEGMENT = 0.1
+
+AUDIO_BITRATE = "192k"
+_PCM_CHUNK = 1 << 20
 
 ProgressFn = Optional[Callable[[int, str], None]]
 
 
-class VideoRenderer:
-    def __init__(self):
-        ffprobe.check_ffmpeg_installed()
+def video_encoding_args() -> List[str]:
+    """Visually lossless H.264, on the GPU when NVENC is available."""
+    if ffprobe.has_nvenc():
+        # -b:v 0 lets -cq drive quality; without it NVENC caps at its default bitrate.
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-rc", "vbr", "-cq", "18", "-b:v", "0"]
+    return ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
 
-    def _encoding_args(self) -> List[str]:
-        """Video encoding arguments: visually lossless, GPU if available."""
-        if ffprobe.has_nvenc():
-            args = ["-c:v", "h264_nvenc", "-preset", "fast", "-rc", "vbr", "-cq", "18"]
-        else:
-            args = ["-c:v", "libx264", "-crf", "18", "-preset", "slow"]
-        return args + ["-pix_fmt", "yuv420p", "-fps_mode", "cfr"]
 
-    def remove_segments(
-        self,
-        input_path: Path,
-        output_path: Path,
-        segments_to_remove: List[Segment],
-        progress: ProgressFn = None,
-        re_encode_video: bool = False,
-        min_keep_segment: float = MIN_KEEP_SEGMENT,
-        cancel_event: "threading.Event | None" = None,
-    ):
-        """Remove the given segments, writing the concatenated remainder.
+def snap_to_frames(segments: List[Segment], fps: Fraction, offset: float = 0.0) -> List[Segment]:
+    """Move every boundary to the nearest source frame boundary.
 
-        Args:
-            re_encode_video: re-encode for frame-precise cuts; otherwise stream
-                copy (fast, but cuts snap to keyframes).
-        """
-        def report(pct: int, msg: str):
-            if progress:
-                progress(pct, msg)
+    Each kept span then holds a whole number of frames, so after the cuts the
+    frames land exactly on the output frame grid. Audio is cut at the same
+    snapped times, which keeps picture and sound locked together (unsnapped
+    cuts let lip sync wander by up to ~2 frames before ffmpeg corrects it).
+    """
+    def snap(t: float) -> float:
+        k = round((Fraction(t) - Fraction(offset)) * fps)
+        return float(Fraction(offset) + k / fps)
 
-        duration = ffprobe.get_duration(input_path)
-        num_audio_tracks = ffprobe.get_audio_track_count(input_path)
+    snapped = [(snap(s), snap(e)) for s, e in segments]
+    return [(s, e) for s, e in snapped if e > s]
 
-        if not segments_to_remove:
-            self.copy_video(input_path, output_path, cancel_event=cancel_event)
-            return
 
-        segments_to_keep = invert_segments(segments_to_remove, duration, min_keep_segment)
-        if not segments_to_keep:
-            raise ValueError("All video content would be removed. Aborting.")
+def video_filter(keep: List[Segment], removed: List[Segment], fps: Fraction,
+                 offset: float = 0.0) -> str:
+    """select + setpts expressions for frame-aligned kept spans.
 
-        temp_dir = Path(tempfile.mkdtemp(prefix="autovidedit_segments_"))
+    Container timestamps are often rounded (Matroska uses milliseconds), so
+    boundaries are compared half a frame early: a frame at t belongs to the
+    span [s, e) when s - half <= t < e - half. Each kept frame is moved
+    earlier by the length of every removed span ending at or before it.
+    """
+    half = float(1 / fps) / 2
+    select = "+".join(
+        f"gte(t,{s + offset - half:.6f})*lt(t,{e + offset - half:.6f})" for s, e in keep
+    )
+    shift = "+".join(
+        f"{e - s:.6f}*gte(T,{e + offset - half:.6f})" for s, e in removed
+    ) or "0"
+    return (
+        f"[0:v]select='{select}',"
+        f"setpts='(T-{offset:.6f}-({shift}))/TB'[vout]\n"
+    )
+
+
+def cut_audio_track(
+    source: Path, track: int, keep: List[Segment], sample_rate: int, channels: int,
+    output: Path, cancel_event: "threading.Event | None" = None,
+    on_seconds: Optional[Callable[[float], None]] = None,
+) -> int:
+    """Decode one audio track and write only the kept samples as raw s16le PCM.
+
+    Returns the number of sample frames written.
+    """
+    frame_bytes = 2 * channels
+    bounds = [(round(s * sample_rate), round(e * sample_rate)) for s, e in keep]
+    cmd = [
+        "ffmpeg", "-v", "error", "-nostdin", "-i", str(source), "-map", f"0:a:{track}",
+        "-f", "s16le", "-acodec", "pcm_s16le",
+        "-ar", str(sample_rate), "-ac", str(channels), "pipe:1",
+    ]
+    written = 0
+    pos = 0          # sample index of the start of the current chunk
+    seg = 0          # first keep bound that may still intersect
+    leftover = b""
+    with open(output, "wb") as out, tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=err)
         try:
-            segment_files = []
-            total = len(segments_to_keep)
-            for idx, (start, end) in enumerate(segments_to_keep):
+            while True:
                 if cancel_event is not None and cancel_event.is_set():
                     raise RenderCancelled("Render cancelled")
-                report(int(idx / total * 90), f"Extracting segment {idx + 1} of {total}")
-                print(f"  Segment {idx + 1}/{total}: {start:.2f}s - {end:.2f}s ({end - start:.2f}s)")
-                segment_file = temp_dir / f"segment_{idx:04d}.mkv"
-                self._extract_segment(
-                    input_path, start, end, segment_file, num_audio_tracks,
-                    re_encode_video, cancel_event=cancel_event,
-                )
-                segment_files.append(segment_file)
-
-            report(90, f"Concatenating {len(segment_files)} segment(s)")
-            self._concatenate(segment_files, output_path, num_audio_tracks, cancel_event=cancel_event)
-        finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-
-    def _extract_segment(
-        self,
-        input_path: Path,
-        start: float,
-        end: float,
-        output_path: Path,
-        num_audio_tracks: int,
-        re_encode_video: bool,
-        cancel_event: "threading.Event | None" = None,
-    ):
-        duration = end - start
-        if duration < 0.01:
-            raise ValueError(
-                f"Segment too short to extract: {duration:.3f}s at {start:.2f}s"
+                data = proc.stdout.read(_PCM_CHUNK)
+                if not data:
+                    break
+                data = leftover + data
+                usable = len(data) - len(data) % frame_bytes
+                data, leftover = data[:usable], data[usable:]
+                n = usable // frame_bytes
+                end = pos + n
+                while seg < len(bounds) and bounds[seg][1] <= pos:
+                    seg += 1
+                i = seg
+                while i < len(bounds) and bounds[i][0] < end:
+                    lo = max(bounds[i][0], pos)
+                    hi = min(bounds[i][1], end)
+                    if hi > lo:
+                        out.write(data[(lo - pos) * frame_bytes:(hi - pos) * frame_bytes])
+                        written += hi - lo
+                    i += 1
+                pos = end
+                if on_seconds:
+                    on_seconds(pos / sample_rate)
+            proc.wait()
+        except BaseException:
+            proc.kill()
+            proc.wait()
+            raise
+        if proc.returncode != 0:
+            err.seek(0)
+            raise ffprobe.FFmpegError(
+                f"audio decode failed for track {track}: "
+                f"{err.read().decode(errors='replace')[-2000:]}"
             )
-
-        args = ["-i", str(input_path), "-ss", f"{start:.3f}", "-t", f"{duration:.3f}",
-                "-map", "0:v"]
-        if re_encode_video:
-            args += self._encoding_args()
-        else:
-            args += ["-c:v", "copy"]
-        for i in range(num_audio_tracks):
-            args += ["-map", f"0:a:{i}"]
-        args += ["-c:a", "copy", "-avoid_negative_ts", "make_zero", str(output_path)]
-
-        ffprobe.run_ffmpeg(args, cancel_event=cancel_event)
-
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            raise RuntimeError(f"Extracted segment is missing or empty: {output_path}")
-
-    def _concatenate(
-        self, video_files: List[Path], output_path: Path, num_audio_tracks: int,
-        cancel_event: "threading.Event | None" = None,
-    ):
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".txt", delete=False
-        ) as concat_file:
-            for video_file in video_files:
-                concat_file.write(f"file '{video_file.absolute()}'\n")
-            concat_path = Path(concat_file.name)
-
-        try:
-            args = ["-f", "concat", "-safe", "0", "-i", str(concat_path), "-map", "0:v"]
-            for i in range(num_audio_tracks):
-                args += ["-map", f"0:a:{i}"]
-            args += ["-c", "copy", str(output_path)]
-            ffprobe.run_ffmpeg(args, cancel_event=cancel_event)
-        finally:
-            concat_path.unlink(missing_ok=True)
-
-    def convert_to_mov(
-        self, input_path: Path, output_path: Path,
-        cancel_event: "threading.Event | None" = None,
-    ):
-        """Re-encode to MOV with constant frame rate and CBR AAC for Kdenlive.
-
-        Fixes VFR and timestamp-drift issues that cause audio crackling when
-        the output is imported into an editor.
-        """
-        frame_rate = ffprobe.get_frame_rate(input_path)
-        num_audio_tracks = ffprobe.get_audio_track_count(input_path)
-
-        args = ["-i", str(input_path), "-map", "0:v"]
-        for i in range(num_audio_tracks):
-            args += ["-map", f"0:a:{i}"]
-        args += self._encoding_args()
-        args += ["-r", str(frame_rate), "-c:a", "aac"]
-        # Set the target bitrate per output stream so every track carries the
-        # same intent (a global -b:a is applied per-stream by ffmpeg anyway, but
-        # being explicit avoids ambiguity across ffmpeg versions/filtergraphs).
-        for i in range(num_audio_tracks):
-            args += [f"-b:a:{i}", "192k"]
-        args += [str(output_path)]
-        ffprobe.run_ffmpeg(args, cancel_event=cancel_event)
-
-    def copy_video(
-        self, input_path: Path, output_path: Path,
-        cancel_event: "threading.Event | None" = None,
-    ):
-        ffprobe.run_ffmpeg(
-            ["-i", str(input_path), "-map", "0", "-c", "copy", str(output_path)],
-            cancel_event=cancel_event,
-        )
-
-    def optimize_keyframes(
-        self, input_path: Path, output_path: Path, progress: Optional[Callable[[str], None]] = None
-    ):
-        """Re-encode with GOP=5 so later stream-copy cuts land near keyframes."""
-        if progress:
-            progress("Optimizing keyframes (GOP=5)...")
-
-        num_audio_tracks = ffprobe.get_audio_track_count(input_path)
-        args = ["-i", str(input_path), "-map", "0:v"]
-        args += self._encoding_args() + ["-g", "5"]
-        for i in range(num_audio_tracks):
-            args += ["-map", f"0:a:{i}"]
-        args += ["-c:a", "copy", "-avoid_negative_ts", "make_zero", str(output_path)]
-        ffprobe.run_ffmpeg(args)
-
-        if not output_path.exists() or output_path.stat().st_size == 0:
-            raise RuntimeError(f"Keyframe-optimized file is missing or empty: {output_path}")
-        if progress:
-            progress("Keyframe optimization complete")
+    return written
 
 
-def render_edit_plan(
-    render_source: Path,
-    output_path: Path,
+def render_video(
+    source: Path,
+    output: Path,
     segments_to_remove: List[Segment],
     progress: ProgressFn = None,
-    re_encode_video: bool = False,
     cancel_event: "threading.Event | None" = None,
-):
-    """Full render: cut segments, then convert to MOV if the output is .mov."""
-    renderer = VideoRenderer()
+) -> Path:
+    """Render `source` minus `segments_to_remove` to `output` (MP4).
 
-    if output_path.suffix.lower() == ".mov":
-        temp_output = output_path.parent / f"{output_path.stem}_temp.mkv"
+    Writes to a hidden sibling file and renames on success, so a failed or
+    cancelled render never leaves a truncated output behind.
+    """
+    def report(pct: int, msg: str):
+        if progress:
+            progress(pct, msg)
+
+    ffprobe.check_ffmpeg_installed()
+    info = ffprobe.probe(source)
+    duration = ffprobe.get_duration(source)
+    streams = info.get("streams", [])
+    video = next((s for s in streams if s.get("codec_type") == "video"), None)
+    if video is None:
+        raise ValueError(f"{source} has no video stream")
+    audio = [s for s in streams if s.get("codec_type") == "audio"]
+    frame_rate = ffprobe.get_frame_rate_fraction(source)
+    fps = Fraction(frame_rate)
+    gop = max(1, round(fps))
+    offset = float(video.get("start_time") or 0.0)
+
+    keep = invert_segments(segments_to_remove, duration, MIN_KEEP_SEGMENT)
+    keep = snap_to_frames(keep, fps, offset)
+    if not keep:
+        raise ValueError("All video content would be removed. Aborting.")
+    kept_seconds = total_length(keep)
+    # Everything not kept is removed, including slivers dropped by MIN_KEEP_SEGMENT,
+    # so derive the shift list from `keep` rather than the raw removal list.
+    removed = merge_segments(invert_segments(keep, duration))
+
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial = output.with_name(f".{output.stem}.partial{output.suffix}")
+
+    # Audio decode+cut is ~10% of the work; video encode is the rest.
+    audio_share = 10 if audio else 0
+
+    with tempfile.TemporaryDirectory(prefix="autovidedit_render_") as tmp:
+        tmp = Path(tmp)
+        audio_inputs = []
+        for t, stream in enumerate(audio):
+            rate = int(stream.get("sample_rate") or 48000)
+            channels = int(stream.get("channels") or 2)
+            raw = tmp / f"track{t}.pcm"
+
+            def on_seconds(sec, t=t):
+                done = (t + min(1.0, sec / duration)) / len(audio)
+                report(int(done * audio_share), f"Cutting audio track {t + 1}/{len(audio)}")
+
+            cut_audio_track(source, t, keep, rate, channels, raw, cancel_event, on_seconds)
+            audio_inputs.append((raw, rate, channels))
+
+        script = tmp / "video.ffgraph"
+        script.write_text(video_filter(keep, removed, fps, offset))
+
+        args = ["-i", str(source)]
+        for raw, rate, channels in audio_inputs:
+            args += ["-f", "s16le", "-ar", str(rate), "-ac", str(channels), "-i", str(raw)]
+        args += ["-filter_complex_script", str(script), "-map", "[vout]"]
+        for t in range(len(audio_inputs)):
+            args += ["-map", f"{t + 1}:a"]
+        args += video_encoding_args()
+        args += ["-pix_fmt", "yuv420p", "-r", frame_rate, "-fps_mode", "cfr", "-g", str(gop)]
+        if audio_inputs:
+            args += ["-c:a", "aac"]
+            for t in range(len(audio_inputs)):
+                args += [f"-b:a:{t}", AUDIO_BITRATE]
+        args += ["-movflags", "+faststart", "-f", "mp4", str(partial)]
+
+        def on_time(seconds_done: float):
+            frac = min(1.0, seconds_done / kept_seconds) if kept_seconds else 0.0
+            pct = audio_share + int(frac * (99 - audio_share))
+            report(pct, f"Encoding {seconds_done:.0f}s of {kept_seconds:.0f}s")
+
+        report(audio_share, f"Encoding {len(keep)} kept span(s), {kept_seconds:.0f}s")
         try:
-            renderer.remove_segments(
-                render_source, temp_output, segments_to_remove, progress,
-                re_encode_video, cancel_event=cancel_event,
-            )
-            if progress:
-                progress(95, "Converting to constant frame rate and CBR AAC audio")
-            renderer.convert_to_mov(temp_output, output_path, cancel_event=cancel_event)
+            ffprobe.run_ffmpeg(args, cancel_event=cancel_event, on_progress=on_time)
+            if not partial.exists() or partial.stat().st_size == 0:
+                raise RuntimeError(f"ffmpeg produced no output: {partial}")
+            partial.replace(output)
         finally:
-            temp_output.unlink(missing_ok=True)
-    else:
-        renderer.remove_segments(
-            render_source, output_path, segments_to_remove, progress,
-            re_encode_video, cancel_event=cancel_event,
-        )
+            partial.unlink(missing_ok=True)
 
-    if progress:
-        progress(100, "Rendering complete")
+    report(100, "Rendering complete")
+    return output

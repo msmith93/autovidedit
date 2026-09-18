@@ -114,3 +114,27 @@ def gaps_between(
     if duration is not None and duration > padded[-1][1]:
         gaps.append((padded[-1][1], duration))
     return gaps
+
+
+def subtract_segments(a: List[Segment], b: List[Segment]) -> List[Segment]:
+    """Return the parts of `a` not covered by `b`."""
+    b = merge_segments(b)
+    result = []
+    for start, end in merge_segments(a):
+        cursor = start
+        for b_start, b_end in b:
+            if b_end <= cursor or b_start >= end:
+                continue
+            if b_start > cursor:
+                result.append((cursor, b_start))
+            cursor = max(cursor, b_end)
+            if cursor >= end:
+                break
+        if cursor < end:
+            result.append((cursor, end))
+    return result
+
+
+def total_length(segments: List[Segment]) -> float:
+    """Sum of segment lengths (segments are merged first)."""
+    return sum(end - start for start, end in merge_segments(segments))

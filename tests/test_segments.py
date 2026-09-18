@@ -62,3 +62,11 @@ def test_gaps_between():
 
 def test_gaps_between_no_segments():
     assert gaps_between([], duration=10.0) == []
+
+
+def test_subtract():
+    from autovidedit.core.segments import subtract_segments
+    assert subtract_segments([(0, 10)], [(2, 3), (5, 7)]) == [(0, 2), (3, 5), (7, 10)]
+    assert subtract_segments([(0, 10)], [(0, 10)]) == []
+    assert subtract_segments([(0, 2), (4, 6)], [(1, 5)]) == [(0, 1), (5, 6)]
+    assert subtract_segments([(0, 2)], []) == [(0, 2)]

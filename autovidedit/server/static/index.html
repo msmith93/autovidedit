@@ -10,8 +10,10 @@
 <header>
   <div class="brand">autovidedit <span id="video-name"></span></div>
   <div class="header-actions">
-    <span id="dirty-indicator" class="dirty hidden">● unsaved changes</span>
-    <button id="save-btn">Save</button>
+    <label class="max-pause" title="Pauses longer than this are shortened to this length">
+      Max pause <input type="number" id="max-pause" min="0" max="10" step="0.1"> s
+    </label>
+    <span id="save-status" class="save-status">saved</span>
     <button id="render-btn" class="primary">Render…</button>
   </div>
 </header>
@@ -28,12 +30,13 @@
       <span class="speed-label">Speed:</span>
       <span id="speed-buttons"></span>
     </div>
-    <div class="hint">Space play/pause · ←/→ seek 5s · S skip removed · click a row to jump · shift/ctrl-click to multi-select · K keep · R remove</div>
+    <div class="hint">Space play/pause · ←/→ seek 5s · S skip removed · click a row to jump · shift/ctrl-click to multi-select · K keep · R remove · changes save automatically</div>
   </section>
 
   <section class="list-pane">
     <div class="list-toolbar">
       <span id="selection-count"></span>
+      <button id="ai-only" title="Show only entries an AI or the analyzer changed, with reasons">AI changes</button>
       <button id="keep-selected" title="K">Keep</button>
       <button id="remove-selected" title="R">Remove</button>
     </div>
@@ -49,10 +52,6 @@
       <p id="render-summary"></p>
       <label>Output file
         <input type="text" id="render-output">
-      </label>
-      <label class="checkbox">
-        <input type="checkbox" id="render-reencode">
-        Re-encode video for frame-precise cuts (slower)
       </label>
       <div class="modal-actions">
         <button id="render-cancel">Cancel</button>

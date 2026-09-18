@@ -8,9 +8,10 @@ from . import ffprobe
 def make_preview_proxy(input_path: Path, output_path: Path):
     """Create an h264/aac +faststart MP4 for review playback in a browser.
 
-    Mixes all audio tracks into one (the browser plays a single track), uses
-    a short GOP for responsive scrubbing, and moderate quality to keep the
-    file small. The original file remains the render source.
+    Mixes all audio tracks into one at full volume (the browser plays a single
+    track), scales to at most 720p, uses a short GOP for responsive scrubbing,
+    and moderate quality to keep the file small. The original file remains the
+    render source.
     """
     num_tracks = ffprobe.get_audio_track_count(input_path)
 
@@ -23,12 +24,13 @@ def make_preview_proxy(input_path: Path, output_path: Path):
 
     if num_tracks > 1:
         amix_inputs = "".join(f"[0:a:{i}]" for i in range(num_tracks))
-        args += ["-filter_complex", f"{amix_inputs}amix=inputs={num_tracks}[aout]"]
+        args += ["-filter_complex", f"{amix_inputs}amix=inputs={num_tracks}:normalize=0[aout]"]
         audio_map = ["-map", "0:v:0", "-map", "[aout]"]
     else:
         audio_map = ["-map", "0:v:0", "-map", "0:a:0"]
 
     args += audio_map + video_args + [
+        "-vf", "scale=-2:'min(720,ih)'",
         "-pix_fmt", "yuv420p",
         "-g", "60",
         "-c:a", "aac", "-b:a", "128k",

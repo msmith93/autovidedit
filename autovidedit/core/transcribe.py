@@ -2,9 +2,11 @@
 
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from . import ffprobe
+
+LogFn = Callable[[str], None]
 
 
 class Transcriber:
@@ -13,7 +15,7 @@ class Transcriber:
         self.device = device
         self._model = None
 
-    def _load_model(self):
+    def _load_model(self, log: LogFn = print):
         if self._model is not None:
             return
         from .cuda_libs import preload_cuda_libs
@@ -25,43 +27,65 @@ class Transcriber:
             raise RuntimeError(
                 "faster-whisper is not installed. Install with: pip install faster-whisper"
             )
-        print(f"Loading Whisper model '{self.model_size}' (device={self.device})...")
+        log(f"Loading Whisper model '{self.model_size}' (device={self.device})...")
         self._model = WhisperModel(
             self.model_size, device=self.device, compute_type="auto"
         )
 
     def transcribe_all_tracks(
-        self, video_path: Path, pause_threshold: float = 0.5
+        self,
+        video_path: Path,
+        pause_threshold: float = 0.5,
+        log: LogFn = print,
+        progress: Optional[Callable[[int, float], None]] = None,
     ) -> List[Dict[str, Any]]:
         """Transcribe every audio track with word timestamps.
 
         Returns sentence dicts sorted by start time:
-        {'start', 'end', 'words' (text), 'audio_track' (1-indexed)}
+        {'start', 'end', 'text', 'words': [{start, end, word}], 'audio_track' (1-indexed)}
+
+        progress(track_number, fraction_done) is called as segments arrive.
         """
-        self._load_model()
+        self._load_model(log)
         num_tracks = ffprobe.get_audio_track_count(video_path)
+        duration = ffprobe.get_duration(video_path)
 
         all_sentences = []
         for track_idx in range(num_tracks):
             track_num = track_idx + 1
-            print(f"Transcribing audio track {track_num}/{num_tracks} (this may take a while)...")
+            log(f"Transcribing audio track {track_num}/{num_tracks}...")
 
             with tempfile.NamedTemporaryFile(suffix=".wav") as tmp:
                 ffprobe.extract_audio_wav(video_path, Path(tmp.name), track_idx)
                 segments, _info = self._model.transcribe(
-                    tmp.name, language="en", word_timestamps=True
+                    tmp.name,
+                    language="en",
+                    word_timestamps=True,
+                    # Skip non-speech audio (fewer hallucinations, faster).
+                    vad_filter=True,
+                    # Stops one hallucination from seeding repeats in later windows.
+                    condition_on_previous_text=False,
                 )
-                words = [
-                    {"start": w.start, "end": w.end, "word": w.word}
-                    for segment in segments
-                    for w in (segment.words or [])
-                ]
+                words = []
+                last_decile = -1
+                for segment in segments:
+                    words.extend(
+                        {"start": w.start, "end": w.end, "word": w.word}
+                        for w in (segment.words or [])
+                    )
+                    fraction = min(1.0, segment.end / duration) if duration else 0.0
+                    if progress:
+                        progress(track_num, fraction)
+                    decile = int(fraction * 10)
+                    if decile > last_decile:
+                        log(f"  track {track_num}: {decile * 10}%")
+                        last_decile = decile
 
             sentences = group_words_into_sentences(words, pause_threshold)
             for sentence in sentences:
                 sentence["audio_track"] = track_num
             all_sentences.extend(sentences)
-            print(f"  Found {len(sentences)} sentence(s) in track {track_num}")
+            log(f"  Found {len(sentences)} sentence(s) in track {track_num}")
 
         all_sentences.sort(key=lambda s: s["start"])
         return all_sentences
@@ -70,7 +94,10 @@ class Transcriber:
 def group_words_into_sentences(
     words: List[Dict[str, Any]], pause_threshold: float = 0.5
 ) -> List[Dict[str, Any]]:
-    """Group timestamped words into sentences split at pauses > pause_threshold."""
+    """Group timestamped words into sentences split at pauses > pause_threshold.
+
+    Each sentence is {'start', 'end', 'text', 'words'}; word text is stripped.
+    """
     sentences = []
     current: List[Dict[str, Any]] = []
 
@@ -79,13 +106,16 @@ def group_words_into_sentences(
             sentences.append({
                 "start": float(current[0]["start"]),
                 "end": float(current[-1]["end"]),
-                "words": " ".join(w["word"].strip() for w in current),
+                "text": " ".join(w["word"] for w in current),
+                "words": list(current),
             })
 
     for word in words:
-        if not word.get("word", "").strip():
+        text = word.get("word", "").strip()
+        if not text:
             continue
-        if current and float(word["start"]) - float(current[-1]["end"]) > pause_threshold:
+        word = {"start": float(word["start"]), "end": float(word["end"]), "word": text}
+        if current and word["start"] - current[-1]["end"] > pause_threshold:
             flush()
             current = []
         current.append(word)

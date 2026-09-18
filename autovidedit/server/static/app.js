@@ -1,20 +1,26 @@
 "use strict";
 
-const REMOVED = "REMOVED";
-const KEPT = "NONE";
+// The server owns all removal math. Every change is saved immediately and the
+// response carries the recomputed removal spans, which drive the waveform,
+// the summary and "skip removed" playback.
+
+const KEEP = "keep";
+const REMOVE = "remove";
 const SPEEDS = [0.5, 1, 1.5, 2, 4, 8];
 
 const state = {
   entries: [],
   duration: 0,
   defaultOutput: "",
-  dirty: {},          // id -> modification, not yet saved
+  removals: [],
+  stats: { count: 0, seconds: 0 },
   rows: [],           // list rows in display order: {entry, el, checkbox}
   selectedIds: new Set(),
   anchorIndex: -1,
   peaks: null,
-  skipMode: true,           // auto-skip removed regions during playback
-  removalSegments: [],      // cached segmentsToRemove(), refreshed by refreshRows
+  skipMode: true,
+  aiOnly: false,
+  saving: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -27,12 +33,17 @@ function fmtTime(seconds) {
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
-const isSentence = (e) => e.reason === "Sentence";
-const isGap = (e) => e.reason === "gap";
-const isSilence = (e) => e.reason === "dead air";
-const isRemoved = (e) => e.modification === REMOVED;
+const isRemoved = (e) => e.decision === REMOVE;
+const isAiTouched = (e) => e.source === "ai" || (e.source === "analyzer" && e.rationale);
 
 // ---------- data ----------
+
+function applyServerRemovals(data) {
+  state.removals = data.removals;
+  state.stats = data.stats;
+  updateSummary();
+  drawWaveform();
+}
 
 async function loadState() {
   const res = await fetch("/api/state");
@@ -41,69 +52,56 @@ async function loadState() {
   state.duration = data.duration;
   state.defaultOutput = data.default_output;
   $("video-name").textContent = data.video_name;
-  $("time-label").textContent = `${fmtTime(0)} / ${fmtTime(state.duration)}`;
+  $("max-pause").value = data.options.max_pause;
+  $("time-label").textContent = `${fmtTime(video.currentTime)} / ${fmtTime(state.duration)}`;
+  applyServerRemovals(data);
   buildList();
-  updateSummary();
 }
 
-function setModification(entry, modification) {
-  if (entry.modification === modification) return;
-  entry.modification = modification;
-  state.dirty[entry.id] = modification;
-  $("dirty-indicator").classList.remove("hidden");
-}
-
-async function save() {
-  if (Object.keys(state.dirty).length === 0) return;
-  const res = await fetch("/api/plan", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ modifications: state.dirty }),
-  });
-  if (!res.ok) {
-    alert("Save failed: " + (await res.text()));
-    return;
-  }
-  state.dirty = {};
-  $("dirty-indicator").classList.add("hidden");
-}
-
-// ---------- removal math (mirrors EditPlan.segments_to_remove) ----------
-
-function mergeSegments(segments) {
-  if (!segments.length) return [];
-  const sorted = [...segments].sort((a, b) => a[0] - b[0]);
-  const merged = [sorted[0].slice()];
-  for (const [start, end] of sorted.slice(1)) {
-    const last = merged[merged.length - 1];
-    if (start <= last[1]) last[1] = Math.max(last[1], end);
-    else merged.push([start, end]);
-  }
-  return merged;
-}
-
-function segmentsToRemove() {
-  const sentences = state.entries.filter(isSentence);
-  const range = (e) => [e.start_time, e.end_time];
-
-  if (!sentences.length) {
-    return mergeSegments(state.entries.filter(isSilence).filter(isRemoved).map(range));
-  }
-  const removed = [
-    ...sentences.filter(isRemoved).map(range),
-    ...state.entries.filter(isGap).filter(isRemoved).map(range),
-  ];
-  const kept = mergeSegments(sentences.filter((e) => !isRemoved(e)).map(range));
-  for (const [sStart, sEnd] of state.entries.filter(isSilence).map(range)) {
-    for (const [kStart, kEnd] of kept) {
-      const start = Math.max(sStart, kStart), end = Math.min(sEnd, kEnd);
-      if (start < end) removed.push([start, end]);
+async function putPlan(body) {
+  state.saving++;
+  $("save-status").textContent = "saving…";
+  try {
+    const res = await fetch("/api/plan", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      alert("Save failed: " + (await res.text()));
+      await loadState();
+      return;
     }
+    applyServerRemovals(await res.json());
+  } finally {
+    state.saving--;
+    $("save-status").textContent = state.saving ? "saving…" : "saved";
   }
-  return mergeSegments(removed);
+}
+
+function setDecisions(entries, decision) {
+  const changes = {};
+  for (const entry of entries) {
+    if (entry.decision === decision && entry.source === "human") continue;
+    entry.decision = decision;
+    entry.source = "human";
+    changes[entry.id] = decision;
+  }
+  if (Object.keys(changes).length) {
+    refreshRows();
+    putPlan({ decisions: changes });
+  }
 }
 
 // ---------- entry list ----------
+
+function describe(entry) {
+  const len = (entry.end - entry.start).toFixed(1);
+  if (entry.kind === "gap") return { badge: `GAP ${len}s`, text: "(no speech on any track)" };
+  if (entry.kind === "cut") return { badge: `CUT ${len}s`, text: entry.rationale || "(cut)" };
+  if (entry.kind === "silence") return { badge: `SILENCE ${len}s`, text: "(silence)" };
+  return { badge: `Track ${entry.track ?? 1}`, text: entry.text || "" };
+}
 
 function buildList() {
   const list = $("entry-list");
@@ -111,14 +109,13 @@ function buildList() {
   state.rows = [];
 
   const items = state.entries
-    .filter((e) => isSentence(e) || isGap(e))
-    .sort((a, b) => a.start_time - b.start_time);
+    .filter((e) => !state.aiOnly || isAiTouched(e))
+    .sort((a, b) => a.start - b.start);
 
   for (const entry of items) {
     const el = document.createElement("div");
     const checkbox = document.createElement("input");
     checkbox.type = "checkbox";
-    checkbox.checked = !isRemoved(entry);
     checkbox.title = "checked = keep in video";
 
     const body = document.createElement("div");
@@ -127,29 +124,31 @@ function buildList() {
     meta.className = "meta";
     const words = document.createElement("div");
     words.className = "words";
+    const note = document.createElement("div");
+    note.className = "note";
 
-    const time = `<span class="time">[${fmtTime(entry.start_time)}]</span>`;
-    if (isGap(entry)) {
-      const len = (entry.end_time - entry.start_time).toFixed(1);
-      meta.innerHTML = `${time}<span class="badge">GAP ${len}s</span>`;
-      words.textContent = "(no speech on any track)";
-    } else {
-      const track = entry.content?.audio_track ?? 1;
-      meta.innerHTML = `${time}<span class="badge">Track ${track}</span>`;
-      words.textContent = entry.content?.words || "";
-    }
-    body.append(meta, words);
+    const { badge, text } = describe(entry);
+    const time = document.createElement("span");
+    time.className = "time";
+    time.textContent = `[${fmtTime(entry.start)}]`;
+    const kindBadge = document.createElement("span");
+    kindBadge.className = "badge";
+    kindBadge.textContent = badge;
+    const sourceBadge = document.createElement("span");
+    sourceBadge.className = "badge source";
+    meta.append(time, kindBadge, sourceBadge);
+    words.textContent = text;
+    body.append(meta, words, note);
     el.append(checkbox, body);
     list.appendChild(el);
 
     const index = state.rows.length;
-    const row = { entry, el, checkbox };
+    const row = { entry, el, checkbox, sourceBadge, note };
     state.rows.push(row);
 
     checkbox.addEventListener("click", (ev) => {
       ev.stopPropagation();
-      setModification(entry, checkbox.checked ? KEPT : REMOVED);
-      refreshRows();
+      setDecisions([entry], checkbox.checked ? KEEP : REMOVE);
     });
     el.addEventListener("click", (ev) => onRowClick(ev, index));
   }
@@ -169,64 +168,66 @@ function onRowClick(ev, index) {
     state.selectedIds.clear();
     state.selectedIds.add(state.rows[index].entry.id);
     state.anchorIndex = index;
-    video.currentTime = state.rows[index].entry.start_time;
+    video.currentTime = state.rows[index].entry.start;
   }
   refreshRows();
 }
 
-function applyToSelection(modification) {
-  for (const row of state.rows) {
-    if (state.selectedIds.has(row.entry.id)) {
-      setModification(row.entry, modification);
-      row.checkbox.checked = modification !== REMOVED;
-    }
-  }
-  refreshRows();
+function applyToSelection(decision) {
+  const entries = state.rows
+    .filter((row) => state.selectedIds.has(row.entry.id))
+    .map((row) => row.entry);
+  setDecisions(entries, decision);
 }
 
-function overlapWarnings() {
-  // Kept sentences overlapping a REMOVED sentence on another track lose part
-  // of their audio context - flag them.
-  const sentences = state.entries.filter(isSentence);
+function partlyKeptIds() {
+  // A removed sentence overlapping kept speech on another track is only
+  // partly cut: kept speech always wins. Flag it so the reviewer knows.
+  const sentences = state.entries.filter((e) => e.kind === "sentence");
   const flagged = new Set();
   for (const a of sentences) {
-    if (isRemoved(a)) continue;
+    if (!isRemoved(a)) continue;
     for (const b of sentences) {
-      if (b === a || !isRemoved(b)) continue;
-      if ((a.content?.audio_track) === (b.content?.audio_track)) continue;
-      if (a.start_time < b.end_time && b.start_time < a.end_time) {
-        flagged.add(a.id);
-        break;
-      }
+      if (b === a || isRemoved(b) || a.track === b.track) continue;
+      if (a.start < b.end && b.start < a.end) { flagged.add(a.id); break; }
     }
   }
   return flagged;
 }
 
 function refreshRows() {
-  state.removalSegments = segmentsToRemove();
-  const warnings = overlapWarnings();
-  for (const { entry, el } of state.rows) {
+  const partly = partlyKeptIds();
+  for (const { entry, el, checkbox, sourceBadge, note } of state.rows) {
+    checkbox.checked = !isRemoved(entry);
     el.className = "entry";
-    if (isGap(entry)) {
-      el.classList.add("gap", isRemoved(entry) ? "removed" : "kept-gap");
-    } else if (isRemoved(entry)) {
-      el.classList.add("removed");
-    }
+    el.classList.add(entry.kind);
+    if (entry.kind === "gap") el.classList.add(isRemoved(entry) ? "removed" : "kept-gap");
+    else if (isRemoved(entry)) el.classList.add("removed");
     if (state.selectedIds.has(entry.id)) el.classList.add("selected");
-    if (warnings.has(entry.id)) el.classList.add("overlap-warn");
+    if (partly.has(entry.id)) {
+      el.classList.add("overlap-warn");
+      el.title = "Partly kept: overlaps kept speech on another track";
+    } else {
+      el.title = "";
+    }
+
+    const label = { ai: "AI", human: "you", analyzer: entry.rationale ? "auto" : "" }[entry.source];
+    sourceBadge.textContent = label || "";
+    sourceBadge.className = "badge source " + entry.source;
+    sourceBadge.classList.toggle("hidden", !label);
+    const confidence = entry.confidence != null ? ` (${Math.round(entry.confidence * 100)}%)` : "";
+    note.textContent = entry.kind !== "cut" && entry.rationale ? entry.rationale + confidence : "";
   }
   const n = state.selectedIds.size;
   $("selection-count").textContent = n ? `${n} selected` : "";
-  updateSummary();
-  drawWaveform();
 }
 
 function updateSummary() {
-  const segments = segmentsToRemove();
-  const total = segments.reduce((acc, [s, e]) => acc + (e - s), 0);
+  const { count, seconds } = state.stats;
+  const remaining = state.duration - seconds;
   $("removal-summary").textContent =
-    `${segments.length} segment(s) to remove - ${total.toFixed(1)}s of ${state.duration.toFixed(1)}s`;
+    `${count} cut(s), ${seconds.toFixed(1)}s removed — ` +
+    `${fmtTime(state.duration)} → ${fmtTime(remaining)}`;
 }
 
 // ---------- playback ----------
@@ -267,22 +268,21 @@ function setupPlayback() {
   });
 
   document.addEventListener("keydown", (ev) => {
-    if (ev.target.tagName === "INPUT" && ev.target.type === "text") return;
+    if (ev.target.tagName === "INPUT" && ev.target.type !== "checkbox") return;
     if (ev.code === "Space") { ev.preventDefault(); toggle(); }
     else if (ev.code === "ArrowLeft") video.currentTime = Math.max(0, video.currentTime - 5);
     else if (ev.code === "ArrowRight") video.currentTime = Math.min(state.duration, video.currentTime + 5);
-    else if (ev.key === "k" || ev.key === "K") applyToSelection(KEPT);
-    else if (ev.key === "r" || ev.key === "R") applyToSelection(REMOVED);
+    else if (ev.key === "k" || ev.key === "K") applyToSelection(KEEP);
+    else if (ev.key === "r" || ev.key === "R") applyToSelection(REMOVE);
     else if (ev.key === "s" || ev.key === "S") setSkip(!state.skipMode);
   });
 }
 
-// Jump the playhead past any removed segment it has entered during playback.
-// Only invoked from timeupdate-while-playing, so manual seeks can still land
-// inside removed regions for inspection.
+// Jump past any removed span the playhead enters during playback. Only called
+// from timeupdate-while-playing, so manual seeks can land inside removed spans.
 function skipRemovedRegion() {
   const t = video.currentTime;
-  for (const [start, end] of state.removalSegments) {
+  for (const [start, end] of state.removals) {
     if (start <= t && t < end) {
       if (end + 0.01 >= state.duration) video.pause();
       else video.currentTime = end + 0.01;
@@ -294,9 +294,7 @@ function skipRemovedRegion() {
 let lastPlayingRow = null;
 function highlightPlayingRow() {
   const t = video.currentTime;
-  const row = state.rows.find(
-    ({ entry }) => entry.start_time <= t && t <= entry.end_time
-  );
+  const row = state.rows.find(({ entry }) => entry.start <= t && t <= entry.end);
   if (row === lastPlayingRow) return;
   lastPlayingRow?.el.classList.remove("playing");
   lastPlayingRow = row || null;
@@ -326,19 +324,17 @@ function canvasSize() {
 }
 
 function drawWaveform() {
-  if (!state.peaks) return;
+  if (!state.peaks || !state.duration) return;
   const { ctx, width, height } = canvasSize();
   ctx.clearRect(0, 0, width, height);
 
-  // removed regions
   ctx.fillStyle = "rgba(224, 91, 91, 0.22)";
-  for (const [start, end] of segmentsToRemove()) {
+  for (const [start, end] of state.removals) {
     const x = (start / state.duration) * width;
-    const w = ((end - start) / state.duration) * width;
+    const w = Math.max(1, ((end - start) / state.duration) * width);
     ctx.fillRect(x, 0, w, height);
   }
 
-  // peaks
   ctx.fillStyle = "#4d9fff";
   const mid = height / 2;
   const barWidth = width / state.peaks.length;
@@ -373,15 +369,13 @@ function setupRender() {
   const modal = $("render-modal");
 
   $("render-btn").addEventListener("click", () => {
-    const segments = segmentsToRemove();
-    if (!segments.length) {
-      alert("No segments are marked for removal - nothing to render.");
+    if (!state.removals.length) {
+      alert("Nothing is marked for removal - nothing to render.");
       return;
     }
-    const total = segments.reduce((acc, [s, e]) => acc + (e - s), 0);
     $("render-summary").textContent =
-      `Removing ${segments.length} segment(s), ${total.toFixed(1)} seconds total.` +
-      (Object.keys(state.dirty).length ? " Unsaved changes will be saved first." : "");
+      `Removing ${state.stats.count} span(s), ${state.stats.seconds.toFixed(1)} seconds total. ` +
+      `Output is MP4 (H.264, constant frame rate, every audio track as AAC).`;
     $("render-output").value = state.defaultOutput;
     $("render-form").classList.remove("hidden");
     $("render-progress").classList.add("hidden");
@@ -392,14 +386,10 @@ function setupRender() {
   $("render-close").addEventListener("click", () => modal.classList.add("hidden"));
 
   $("render-start").addEventListener("click", async () => {
-    await save();
     const res = await fetch("/api/render", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        output: $("render-output").value,
-        re_encode: $("render-reencode").checked,
-      }),
+      body: JSON.stringify({ output: $("render-output").value }),
     });
     if (!res.ok) {
       alert("Render failed to start: " + (await res.text()));
@@ -425,7 +415,6 @@ function setupRender() {
           $("progress-msg").className = "success";
         } else if (data.cancelled) {
           $("progress-msg").textContent = "Render cancelled.";
-          $("progress-msg").className = "";
         } else {
           $("progress-msg").textContent = "Render failed: " + data.error;
           $("progress-msg").className = "error";
@@ -437,22 +426,26 @@ function setupRender() {
   $("render-cancel-run").addEventListener("click", async () => {
     $("render-cancel-run").disabled = true;
     const res = await fetch("/api/render/cancel", { method: "POST" });
-    if (!res.ok && res.status !== 409) {
-      alert("Cancel failed: " + (await res.text()));
-    }
+    if (!res.ok && res.status !== 409) alert("Cancel failed: " + (await res.text()));
     $("render-cancel-run").disabled = false;
   });
 }
 
 // ---------- init ----------
 
-$("save-btn").addEventListener("click", save);
-$("keep-selected").addEventListener("click", () => applyToSelection(KEPT));
-$("remove-selected").addEventListener("click", () => applyToSelection(REMOVED));
-
-window.addEventListener("beforeunload", (ev) => {
-  if (Object.keys(state.dirty).length) ev.preventDefault();
+$("keep-selected").addEventListener("click", () => applyToSelection(KEEP));
+$("remove-selected").addEventListener("click", () => applyToSelection(REMOVE));
+$("ai-only").addEventListener("click", () => {
+  state.aiOnly = !state.aiOnly;
+  $("ai-only").classList.toggle("active", state.aiOnly);
+  buildList();
 });
+$("max-pause").addEventListener("change", (ev) => {
+  const value = parseFloat(ev.target.value);
+  if (!Number.isNaN(value)) putPlan({ max_pause: value });
+});
+// Pick up plan edits made outside the browser (e.g. `autovidedit plan apply`).
+window.addEventListener("focus", () => { if (!state.saving) loadState(); });
 
 setupPlayback();
 setupWaveformSeek();

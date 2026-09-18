@@ -1,4 +1,4 @@
-"""Endpoint tests for the FastAPI review server (tests/test_server.py).
+"""Endpoint tests for the FastAPI review server.
 
 Uses fastapi.testclient.TestClient against synthetic fixture videos. The render
 tests exercise the real ffmpeg pipeline, so they are the slow ones here.
@@ -6,6 +6,7 @@ tests exercise the real ffmpeg pipeline, so they are the slow ones here.
 
 import glob
 import json
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -14,7 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from autovidedit.core import ffprobe
-from autovidedit.core.edit_plan import KEPT, REMOVED, EditPlan
+from autovidedit.core.edit_plan import KEEP, REMOVE, DecisionItem, DecisionSet, EditPlan
 from autovidedit.core.ffprobe import get_duration, probe
 from autovidedit.server import app as app_module
 from autovidedit.server.app import create_app
@@ -22,35 +23,34 @@ from tests.conftest import FIXTURE_DURATION, SILENCE_SPANS
 
 
 def _removal_plan(path: Path) -> EditPlan:
-    """A plan that removes real time: two kept sentences with gaps between."""
-    plan = EditPlan()
+    """Two kept sentences with removable pauses around them."""
+    plan = EditPlan(duration=FIXTURE_DURATION)
     plan.add_sentence(1.0, 3.0, "first track speaking here", 1)
     plan.add_sentence(7.0, 12.0, "second track speaking now", 2)
     for start, end in SILENCE_SPANS:
         plan.add_silence(start, end)
-    plan.ensure_gaps(FIXTURE_DURATION)
+    plan.ensure_gaps()
     plan.save(path)
     return plan
 
 
 def _no_removal_plan(path: Path) -> EditPlan:
-    """A plan with nothing marked for removal (a kept sentence + kept gap)."""
-    plan = EditPlan()
+    """Nothing marked for removal: one kept sentence and a kept gap."""
+    plan = EditPlan(duration=FIXTURE_DURATION)
     plan.add_sentence(1.0, 5.0, "only sentence", 1)
     gap = plan.add_gap(5.0, 8.0)
-    plan.set_modification(gap["id"], KEPT)  # keep it so ensure_gaps stays a no-op
+    plan.set_decision(gap.id, KEEP)
     plan.save(path)
     return plan
 
 
 def _make_client(tmp_path, fixture_video, fixture_video_2track,
-                 build_plan=_removal_plan, output_name="out.mov") -> TestClient:
+                 build_plan=_removal_plan, output_name="out.mp4") -> TestClient:
     plan_path = tmp_path / "plan.json"
     build_plan(plan_path)
     app = create_app(
-        video_name="test_input.mkv",
+        video_path=fixture_video_2track,
         preview_path=fixture_video,
-        render_source=fixture_video_2track,
         plan_path=plan_path,
         default_output=tmp_path / output_name,
     )
@@ -86,35 +86,64 @@ def test_index_html(client):
 
 
 def test_state(client):
-    resp = client.get("/api/state")
-    assert resp.status_code == 200
-    data = resp.json()
+    data = client.get("/api/state").json()
     assert abs(data["duration"] - FIXTURE_DURATION) < 0.5
-    assert data["entries"], "no entries returned"
-    assert all(e.get("id") for e in data["entries"])
+    assert data["entries"] and all(e.get("id") for e in data["entries"])
+    # Silences are an analyzer detail when sentences exist; the UI doesn't list them.
+    assert {e["kind"] for e in data["entries"]} == {"sentence", "gap"}
+    assert data["removals"] and data["stats"]["count"] == len(data["removals"])
+    assert data["options"]["max_pause"] == 0.5
 
 
 # ---------- plan editing ----------
 
-def test_plan_put_persists(client, tmp_path):
-    entry_id = client.get("/api/state").json()["entries"][0]["id"]
-    resp = client.put("/api/plan", json={"modifications": {entry_id: REMOVED}})
+def test_plan_put_persists_as_human_and_returns_removals(client, tmp_path):
+    sentence = next(e for e in client.get("/api/state").json()["entries"]
+                    if e["kind"] == "sentence")
+    resp = client.put("/api/plan", json={"decisions": {sentence["id"]: REMOVE}})
     assert resp.status_code == 200
+    removals = resp.json()["removals"]
+    assert any(s <= sentence["start"] and sentence["end"] <= e for s, e in removals)
 
-    saved = json.loads((tmp_path / "plan.json").read_text())
-    entry = next(e for e in saved if e["id"] == entry_id)
-    assert entry["modification"] == REMOVED
+    saved = EditPlan.load(tmp_path / "plan.json").get(sentence["id"])
+    assert saved.decision == REMOVE and saved.source == "human"
+
+
+def test_plan_put_max_pause(client, tmp_path):
+    before = client.get("/api/state").json()["stats"]["seconds"]
+    resp = client.put("/api/plan", json={"max_pause": 0.0})
+    assert resp.status_code == 200
+    assert resp.json()["stats"]["seconds"] > before
+    assert EditPlan.load(tmp_path / "plan.json").options.max_pause == 0.0
 
 
 def test_plan_put_unknown_id(client):
-    resp = client.put("/api/plan", json={"modifications": {"deadbeef0000": REMOVED}})
+    resp = client.put("/api/plan", json={"decisions": {"deadbeef0000": REMOVE}})
     assert resp.status_code == 400
 
 
 def test_plan_put_invalid_value(client):
     entry_id = client.get("/api/state").json()["entries"][0]["id"]
-    resp = client.put("/api/plan", json={"modifications": {entry_id: "MAYBE"}})
+    resp = client.put("/api/plan", json={"decisions": {entry_id: "MAYBE"}})
     assert resp.status_code == 400
+
+
+def test_server_picks_up_plan_edits_made_on_disk(client, tmp_path):
+    """An agent running `plan apply` while the UI is open must not be clobbered."""
+    plan_path = tmp_path / "plan.json"
+    sentence = EditPlan.load(plan_path).sentences[0]
+    client.get("/api/state")
+
+    plan = EditPlan.load(plan_path)
+    plan.apply_decisions(DecisionSet(decisions=[
+        DecisionItem(id=sentence.id, decision=REMOVE, rationale="agent says cut"),
+    ]))
+    plan.save(plan_path)
+    os.utime(plan_path, ns=(time.time_ns(), time.time_ns() + 10_000_000))
+
+    entry = next(e for e in client.get("/api/state").json()["entries"]
+                 if e["id"] == sentence.id)
+    assert entry["decision"] == REMOVE and entry["rationale"] == "agent says cut"
 
 
 # ---------- video streaming ----------
@@ -151,7 +180,6 @@ def test_waveform_shape_and_cache(client, fixture_video, monkeypatch):
     assert all(0.0 <= p <= 1.0 for p in peaks)
     assert cache.exists()
 
-    # Second call must come from cache: break the computer and expect success.
     def _boom(*a, **k):
         raise AssertionError("waveform should have been served from cache")
 
@@ -159,6 +187,16 @@ def test_waveform_shape_and_cache(client, fixture_video, monkeypatch):
     resp2 = client.get("/api/waveform")
     assert resp2.status_code == 200
     assert resp2.json()["peaks"] == peaks
+
+
+def test_waveform_cache_refreshes_when_preview_is_newer(client, fixture_video, monkeypatch):
+    cache = fixture_video.with_suffix(".waveform.json")
+    cache.write_text(json.dumps({"points": 1, "peaks": [0.5]}))
+    old = fixture_video.stat().st_mtime - 100
+    os.utime(cache, (old, old))
+    monkeypatch.setattr(app_module, "_compute_peaks", lambda path, points: [0.1] * points)
+    assert client.get("/api/waveform").json()["peaks"][:2] == [0.1, 0.1]
+    cache.unlink()
 
 
 # ---------- render ----------
@@ -169,54 +207,43 @@ def test_render_no_segments_400(tmp_path, fixture_video, fixture_video_2track):
     )
     resp = client.post("/api/render", json={})
     assert resp.status_code == 400
+    # A rejected render must not leave the server stuck in "running".
+    assert client.post("/api/render/cancel").status_code == 409
 
 
-def test_render_produces_two_track_mov(client, tmp_path):
-    output = tmp_path / "out.mov"
-    resp = client.post("/api/render", json={"output": str(output), "re_encode": False})
+def test_render_produces_two_track_mp4(client, tmp_path):
+    output = tmp_path / "out.mp4"
+    resp = client.post("/api/render", json={"output": str(output)})
     assert resp.status_code == 200
-    assert resp.json()["segments"] > 0
+    assert resp.json()["count"] > 0
 
     snapshot = _drain_progress(client)
-    assert snapshot["success"] is True
+    assert snapshot["success"] is True, snapshot
     assert output.exists()
 
     assert get_duration(output) < FIXTURE_DURATION - 1.0
     audio = [s for s in probe(output)["streams"] if s["codec_type"] == "audio"]
     assert len(audio) == 2
     assert all(s["codec_name"] == "aac" for s in audio)
-
-
-def test_convert_to_mov_loud_track_bitrate(tmp_path, fixture_video_2track):
-    """Task B: per-stream 192k intent; the loud (incompressible) track lands
-    near target, the quiet track undershoots (ABR encoder, acceptable)."""
-    from autovidedit.core.render import VideoRenderer
-
-    output = tmp_path / "bitrate.mov"
-    VideoRenderer().convert_to_mov(fixture_video_2track, output)
-
-    audio = [s for s in probe(output)["streams"] if s["codec_type"] == "audio"]
-    assert len(audio) == 2
-    assert all(s["codec_name"] == "aac" for s in audio)
-    loud_bitrate = int(audio[0]["bit_rate"])
-    assert abs(loud_bitrate - 192_000) <= 0.15 * 192_000
+    # The loud (pink noise) track lands near the 192k target; quiet tracks
+    # undershoot because AAC is ABR, which is expected.
+    assert abs(int(audio[0]["bit_rate"]) - 192_000) <= 0.15 * 192_000
 
 
 # ---------- cancellation ----------
 
 def test_cancel_when_idle_409(client):
-    resp = client.post("/api/render/cancel")
-    assert resp.status_code == 409
+    assert client.post("/api/render/cancel").status_code == 409
 
 
 def test_cancel_mid_render(tmp_path, fixture_video, fixture_video_2track, monkeypatch):
-    # Force libx264 (no NVENC) so the re-encode is slow enough to cancel.
+    # Force libx264 so the encode is slow enough to cancel.
     monkeypatch.setattr(ffprobe, "has_nvenc", lambda: False)
-    before = set(glob.glob(str(Path(tempfile.gettempdir()) / "autovidedit_segments_*")))
+    before = set(glob.glob(str(Path(tempfile.gettempdir()) / "autovidedit_render_*")))
 
     client = _make_client(tmp_path, fixture_video, fixture_video_2track)
-    output = tmp_path / "cancelled.mov"
-    resp = client.post("/api/render", json={"output": str(output), "re_encode": True})
+    output = tmp_path / "cancelled.mp4"
+    resp = client.post("/api/render", json={"output": str(output)})
     assert resp.status_code == 200
 
     cancel = client.post("/api/render/cancel")
@@ -226,6 +253,7 @@ def test_cancel_mid_render(tmp_path, fixture_video, fixture_video_2track, monkey
     snapshot = _drain_progress(client)
     assert snapshot["cancelled"] is True
     assert snapshot["success"] is False
+    assert not output.exists()
 
-    leftover = set(glob.glob(str(Path(tempfile.gettempdir()) / "autovidedit_segments_*")))
+    leftover = set(glob.glob(str(Path(tempfile.gettempdir()) / "autovidedit_render_*")))
     assert leftover == before, f"leftover temp dirs: {leftover - before}"

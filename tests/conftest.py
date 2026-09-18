@@ -55,3 +55,36 @@ def fixture_video_2track(tmp_path_factory) -> Path:
         check=True, capture_output=True,
     )
     return path
+
+
+SYNC_DURATION = 30.0
+
+
+@pytest.fixture(scope="session")
+def fixture_sync_video(tmp_path_factory) -> Path:
+    """Picture and sound switch on and off together every second.
+
+    Video is white when a tone plays on both audio tracks and black when they
+    are silent (on for [2k, 2k+1), off for [2k+1, 2k+2)). After any set of
+    cuts, every luminance edge must still line up with an audio edge.
+    """
+    path = tmp_path_factory.mktemp("fixtures") / "sync.mkv"
+    on = "lt(mod(t,2),1)"
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-y",
+            "-f", "lavfi", "-i", f"color=c=black:s=160x120:r=30:d={SYNC_DURATION}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={SYNC_DURATION}",
+            "-f", "lavfi", "-i", f"sine=frequency=660:sample_rate=48000:duration={SYNC_DURATION}",
+            "-filter_complex",
+            f"[0:v]geq=lum='if(lt(mod(T\\,2)\\,1)\\,235\\,16)':cb=128:cr=128[v];"
+            f"[1:a]volume=eval=frame:volume='{on}'[a1];"
+            f"[2:a]volume=eval=frame:volume='{on}'[a2]",
+            "-map", "[v]", "-map", "[a1]", "-map", "[a2]",
+            "-c:v", "libx264", "-preset", "ultrafast", "-g", "30",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "1",
+            str(path),
+        ],
+        check=True, capture_output=True,
+    )
+    return path
