@@ -50,30 +50,6 @@ def test_save_is_atomic_and_leaves_no_temp_files(tmp_path):
     assert (tmp_path / "plan.json").stat().st_mode & 0o044
 
 
-def test_migrates_v1_plan(tmp_path):
-    legacy = [
-        {"id": "a1", "start_time": 0.5, "end_time": 1.0, "modification": "REMOVED",
-         "reason": "dead air", "duration": 0.5},
-        {"id": "b2", "start_time": 1.0, "end_time": 3.0, "modification": "NONE",
-         "reason": "Sentence", "content": {"audio_track": 2, "words": "kept by default"}},
-        {"id": "c3", "start_time": 3.0, "end_time": 5.0, "modification": "REMOVED",
-         "reason": "Sentence", "content": {"audio_track": 1, "words": "reviewer removed"}},
-        {"start_time": 5.0, "end_time": 6.0, "modification": "NONE", "reason": "gap"},
-    ]
-    path = tmp_path / "legacy.json"
-    path.write_text(json.dumps(legacy))
-    plan = EditPlan.load(path)
-
-    by_id = {e.id: e for e in plan.entries}
-    assert by_id["a1"].kind == "silence" and by_id["a1"].source == "analyzer"
-    assert by_id["b2"].text == "kept by default" and by_id["b2"].track == 2
-    assert by_id["b2"].source == "analyzer"
-    # Non-default decisions can only have come from a reviewer.
-    assert by_id["c3"].decision == REMOVE and by_id["c3"].source == "human"
-    gap = plan.gaps[0]
-    assert gap.decision == KEEP and gap.source == "human" and gap.id
-
-
 # ---------- gaps ----------
 
 def test_ensure_gaps_derives_from_sentences_and_skips_short_ones():

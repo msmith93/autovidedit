@@ -27,7 +27,6 @@ class Project:
 
     @property
     def plan_path(self) -> Path:
-        # Name kept from v1 so existing plans are picked up and migrated.
         return self.out_dir / f"{self.stem}_modifications.json"
 
     @property

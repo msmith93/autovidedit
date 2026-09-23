@@ -22,9 +22,6 @@ overwritten by automated passes; see `EditPlan.apply_decisions`.
 
 Removal semantics live in `EditPlan.segments_to_remove`; the review UI gets
 the result from the server rather than re-implementing it.
-
-Version 1 plans (a bare JSON list with modification/reason/content fields)
-are migrated on load.
 """
 
 from __future__ import annotations
@@ -166,10 +163,8 @@ class EditPlan(BaseModel):
     @classmethod
     def load(cls, path: Path) -> "EditPlan":
         data = json.loads(Path(path).read_text())
-        if isinstance(data, list):
-            return cls(entries=[_migrate_v1_entry(e) for e in data])
         if not isinstance(data, dict):
-            raise ValueError(f"Edit plan {path} must be a JSON object or list")
+            raise ValueError(f"Edit plan {path} must be a JSON object")
         return cls.model_validate(data)
 
     def save(self, path: Path):
@@ -394,32 +389,6 @@ class EditPlan(BaseModel):
 
         result = merge_segments(content + trimmed)
         return [(max(0.0, s), min(e, duration)) for s, e in result if s < duration]
-
-
-def _migrate_v1_entry(raw: dict) -> Entry:
-    """Convert a version-1 entry (modification/reason/content) to an Entry.
-
-    A v1 decision that differs from the kind's default can only have come
-    from a reviewer, so it is marked source="human" and protected.
-    """
-    kind = {"dead air": "silence", "Sentence": "sentence", "gap": "gap"}.get(
-        raw.get("reason"), "silence"
-    )
-    decision = REMOVE if raw.get("modification") == "REMOVED" else KEEP
-    content = raw.get("content") or {}
-    fields = dict(
-        start=_r(raw.get("start_time", 0.0)),
-        end=_r(raw.get("end_time", 0.0)),
-        kind=kind,
-        decision=decision,
-        source="human" if decision != DEFAULT_DECISION[kind] else "analyzer",
-    )
-    if raw.get("id"):
-        fields["id"] = raw["id"]
-    if kind == "sentence":
-        fields["track"] = content.get("audio_track")
-        fields["text"] = content.get("words")
-    return Entry(**fields)
 
 
 def removal_stats(segments: Iterable[Segment]) -> dict:
