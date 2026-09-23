@@ -1,9 +1,8 @@
 *.mkv
-*.json
-__pycache__
-generate.sh
-preprocess.sh
-applyedit.sh
-videdit.sh
-venv
-*_preprocessed
+*.mp4
+*.mov
+*_preprocessed/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+venv/
